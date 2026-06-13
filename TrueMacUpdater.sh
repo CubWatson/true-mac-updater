@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # ╭───────────────────────────────────────────────────────────────────────╮
-# │  TrueMacUpdater — the one command that updates your whole Mac          │
+# │  TrueMacUpdater — the one command that updates your whole Mac         │
 # │                                                                       │
 # │  • Homebrew     formulae, casks, and cleanup                          │
 # │  • App Store    every app you bought, via mas                         │
