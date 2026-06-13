@@ -105,8 +105,9 @@ confirm() {
   [[ "$ASSUME_YES" == true ]] && return 0
   [[ "$STDOUT_IS_TTY" != true ]] && return 0  # non-interactive: don't block
   [[ "$default" == "N" ]] && hint="[y/N]"
-  printf '%s?%s %s %s ' "$YELLOW" "$NC" "$prompt" "$hint"
-  read -r reply || reply=""
+  # Talk to the terminal directly so prompts aren't swallowed by the log tee.
+  printf '%s?%s %s %s ' "$YELLOW" "$NC" "$prompt" "$hint" > /dev/tty
+  read -r reply < /dev/tty || reply=""
   reply="${reply:-$default}"
   [[ "$reply" =~ ^[Yy] ]]
 }
@@ -242,7 +243,7 @@ ensure_brew_on_path() {
 
 install_homebrew() {
   confirm "Homebrew isn't installed. Install it now?" "Y" || return 1
-  info "Installing Homebrew (runs Apple's official installer)…"
+  info "Installing Homebrew (runs Homebrew's official installer)…"
   /bin/bash -c \
     "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
     || return 1
@@ -262,7 +263,7 @@ stage_homebrew() {
       ok "Homebrew installed."
     else
       err "Could not set up Homebrew. Skipping this stage."
-      BREW_RESULT="failed"; ((FAILURES++)); return
+      BREW_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
     fi
   fi
 
@@ -273,8 +274,10 @@ stage_homebrew() {
     warn "'brew update' had trouble; continuing with what we have."
   fi
 
-  # Count outdated items for the summary.
-  BREW_COUNT=$(brew outdated --quiet 2>/dev/null | grep -c . || true)
+  # Grab the outdated list once; 'brew upgrade' also covers outdated casks.
+  local outdated
+  outdated=$(brew outdated 2>/dev/null || true)
+  BREW_COUNT=$(printf '%s' "$outdated" | grep -c . || true)
   BREW_COUNT=${BREW_COUNT:-0}
 
   if [[ "$BREW_COUNT" -eq 0 ]]; then
@@ -282,19 +285,19 @@ stage_homebrew() {
     BREW_RESULT="ok"
   else
     info "${BREW_COUNT} package(s) can be upgraded:"
-    brew outdated 2>/dev/null | sed 's/^/    /'
+    printf '%s\n' "$outdated" | sed 's/^/    /'
     echo ""
     if [[ "$DRY_RUN" == true ]]; then
       note "Dry run: would run 'brew upgrade' (formulae + casks)."
       BREW_RESULT="ok"
     elif confirm "Upgrade these now?" "Y"; then
       step "Upgrading formulae & casks (casks may ask for your password)…"
-      if brew upgrade && brew upgrade --cask --greedy; then
+      if brew upgrade; then
         ok "Homebrew packages upgraded."
         BREW_RESULT="ok"
       else
         warn "Some Homebrew upgrades failed (see output above)."
-        BREW_RESULT="failed"; ((FAILURES++))
+        BREW_RESULT="failed"; FAILURES=$((FAILURES + 1))
       fi
     else
       note "Skipped by choice."
@@ -324,7 +327,7 @@ stage_appstore() {
       step "'mas' (Mac App Store CLI) isn't installed — adding it via Homebrew…"
       if ! brew install mas; then
         err "Couldn't install 'mas'. Skipping App Store."
-        APPSTORE_RESULT="failed"; ((FAILURES++)); return
+        APPSTORE_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
       fi
     else
       warn "'mas' and Homebrew are both missing — can't update App Store apps."
@@ -359,7 +362,7 @@ stage_appstore() {
       APPSTORE_RESULT="ok"
     else
       warn "Some App Store updates failed (are you signed in to the App Store?)."
-      APPSTORE_RESULT="failed"; ((FAILURES++))
+      APPSTORE_RESULT="failed"; FAILURES=$((FAILURES + 1))
     fi
   else
     note "Skipped by choice."
@@ -414,7 +417,7 @@ stage_system() {
 
   if ! ensure_sudo; then
     err "Administrator access denied — skipping system updates."
-    SYSTEM_RESULT="failed"; ((FAILURES++)); return
+    SYSTEM_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
   fi
 
   step "Installing system updates (this can take a while)…"
@@ -429,7 +432,7 @@ stage_system() {
     SYSTEM_RESULT="ok"
   else
     warn "softwareupdate reported a problem (see output above)."
-    SYSTEM_RESULT="failed"; ((FAILURES++))
+    SYSTEM_RESULT="failed"; FAILURES=$((FAILURES + 1))
   fi
 }
 
