@@ -31,6 +31,7 @@ DO_BREW=true
 DO_APPSTORE=true
 DO_SYSTEM=true
 DO_CLEANUP=true
+DO_TRUST=true
 DRY_RUN=false
 ASSUME_YES=false
 USE_COLOR=true
@@ -137,6 +138,7 @@ ${BOLD}OPTIONS${NC}
       --skip-appstore  Skip the App Store stage
       --skip-system    Skip the macOS system-update stage
       --no-cleanup     Don't run 'brew cleanup'
+      --no-trust       Don't auto-trust installed third-party-tap packages
 
       --no-color       Disable colored output
       --no-log         Don't write a transcript to ~/Library/Logs
@@ -165,6 +167,7 @@ parse_args() {
       --skip-appstore)  DO_APPSTORE=false ;;
       --skip-system)    DO_SYSTEM=false ;;
       --no-cleanup)     DO_CLEANUP=false ;;
+      --no-trust)       DO_TRUST=false ;;
       --no-color)       USE_COLOR=false ;;
       --no-log)         USE_LOG=false ;;
       -h|--help)        setup_colors; print_help; exit 0 ;;
@@ -250,6 +253,61 @@ install_homebrew() {
   ensure_brew_on_path
 }
 
+# Homebrew 6 refuses to *load* formulae/casks from non-official ("untrusted")
+# taps, which makes 'brew upgrade' quietly skip them with a one-line warning.
+# Anything you already have installed from a third-party tap is code you've
+# already chosen to run, so we trust those up front — but nothing more, so a
+# brand-new install from an untrusted tap still asks you first.
+#
+# We read the on-disk install receipts rather than 'brew info', because brew
+# won't even load the metadata of an untrusted package — the exact ones we need
+# to find. Each receipt records its origin under "source": { "tap": ... }, and
+# every receipt has precisely one "tap" key, so a plain sed pulls it out with no
+# dependency on jq (which isn't present on macOS before 15).
+trust_installed_packages() {
+  local prefix
+  prefix=$(brew --prefix 2>/dev/null) || return 0
+
+  # Build a newline list of "<flag>\t<full-name>" for installed packages whose
+  # tap isn't an official homebrew/* one. Formulae and casks store receipts in
+  # different places, so handle each.
+  local entries="" receipt tap name
+  for receipt in "$prefix"/Cellar/*/*/INSTALL_RECEIPT.json; do
+    [[ -f "$receipt" ]] || continue            # unmatched glob stays literal
+    tap=$(sed -n 's/.*"tap"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$receipt" | head -1)
+    case "$tap" in homebrew/*|"") continue ;; esac
+    name=$(basename "$(dirname "$(dirname "$receipt")")")
+    entries+="--formula	${tap}/${name}"$'\n'
+  done
+  for receipt in "$prefix"/Caskroom/*/.metadata/INSTALL_RECEIPT.json; do
+    [[ -f "$receipt" ]] || continue
+    tap=$(sed -n 's/.*"tap"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$receipt" | head -1)
+    case "$tap" in homebrew/*|"") continue ;; esac
+    name=$(basename "$(dirname "$(dirname "$receipt")")")
+    entries+="--cask	${tap}/${name}"$'\n'
+  done
+
+  entries=$(printf '%s' "$entries" | sed '/^$/d' | sort -u)
+  [[ -z "$entries" ]] && return 0
+
+  local count flag fullname
+  count=$(printf '%s\n' "$entries" | grep -c .)
+  step "Trusting ${count} installed package(s) from third-party taps so upgrades don't skip them…"
+
+  while IFS=$'\t' read -r flag fullname; do
+    [[ -z "$fullname" ]] && continue
+    if [[ "$DRY_RUN" == true ]]; then
+      note "Dry run: would run 'brew trust ${flag} ${fullname}'."
+    elif brew trust "$flag" "$fullname" >/dev/null 2>&1; then
+      note "trusted ${fullname}"
+    else
+      warn "Couldn't trust ${fullname} (continuing)."
+    fi
+  done <<EOF
+$entries
+EOF
+}
+
 stage_homebrew() {
   section "1 · Homebrew"
 
@@ -273,6 +331,10 @@ stage_homebrew() {
   elif ! brew update; then
     warn "'brew update' had trouble; continuing with what we have."
   fi
+
+  # Trust already-installed third-party-tap packages before anything tries to
+  # load them, so 'brew outdated'/'brew upgrade' don't silently skip them.
+  [[ "$DO_TRUST" == true ]] && trust_installed_packages
 
   # Grab the outdated list once; 'brew upgrade' also covers outdated casks.
   local outdated

@@ -33,6 +33,7 @@ It's **resilient**: if one stage hits a problem, the others still run, and the s
 - **Safe by default** — shows you what's outdated and asks before changing anything.
 - **`--dry-run`** — preview everything without touching your system.
 - **Self-healing** — installs `mas` (and offers to install Homebrew) if they're missing.
+- **No more skipped taps** — auto-trusts packages you already have installed from third-party Homebrew taps, so `brew upgrade` stops silently skipping them (Homebrew 6+). New, not-yet-installed packages still prompt you; opt out with `--no-trust`.
 - **Sudo kept alive** — type your password once; no mid-run interruptions.
 - **Honest summary** — per-stage status, counts, elapsed time, and restart detection.
 - **Full transcript** saved to `~/Library/Logs/TrueMacUpdater/`.
@@ -58,6 +59,7 @@ It's **resilient**: if one stage hits a problem, the others still run, and the s
 | `--skip-appstore` | Skip the App Store stage |
 | `--skip-system` | Skip the macOS system-update stage |
 | `--no-cleanup` | Don't run `brew cleanup` |
+| `--no-trust` | Don't auto-trust installed packages from third-party taps |
 | `--no-color` | Disable colored output |
 | `--no-log` | Don't write a transcript |
 | `-h, --help` | Show help |
