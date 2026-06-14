@@ -4,7 +4,7 @@
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](https://www.apple.com/macos/)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M--series-black?logo=apple&logoColor=white)](https://www.apple.com/mac/m4/)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnu-bash&logoColor=white)](https://www.gnu.org/software/bash/)
-[![Version](https://img.shields.io/badge/version-2.0.0-blue)](TrueMacUpdater.sh)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue)](TrueMacUpdater.sh)
 
 **One command to update your entire Mac** — Homebrew, the App Store, and macOS itself.
 
