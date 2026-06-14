@@ -16,7 +16,7 @@ Built for Apple Silicon (M-series, `arm64`).
 
 That's it. The script walks through three stages and gives you a clean summary at the end.
 
----
+<img width="1920" height="1105" alt="Screen Recording 2026-06-13 at 9 30 48 PM" src="https://github.com/user-attachments/assets/2d8b2a83-bad8-4be6-a6d3-27f4b94e440a" />
 
 ## What it does
 
