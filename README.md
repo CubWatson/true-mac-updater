@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](https://www.apple.com/macos/)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnu-bash&logoColor=white)](https://www.gnu.org/software/bash/)
-[![Version](https://img.shields.io/badge/version-1.0.0-blue)](TrueMacUpdater.sh)
+[![Version](https://img.shields.io/badge/version-2.0.0-blue)](TrueMacUpdater.sh)
 
 **One command to update your entire Mac** — Homebrew, the App Store, and macOS itself.
 
@@ -33,6 +33,7 @@ It's **resilient**: if one stage hits a problem, the others still run, and the s
 - **`--dry-run`** — preview everything without touching your system.
 - **Self-healing** — installs `mas` (and offers to install Homebrew) if they're missing.
 - **No more skipped taps** — auto-trusts packages you already have installed from third-party Homebrew taps, so `brew upgrade` stops silently skipping them (Homebrew 6+). New, not-yet-installed packages still prompt you; opt out with `--no-trust`.
+- **Recovers from link conflicts** — when a formula's `brew link` step collides with files a cask already owns (classically the `docker` formula vs. the `docker-desktop` cask), it auto-runs Homebrew's own `brew link --overwrite` fix instead of failing the whole Homebrew stage. A genuine upgrade failure still reports as failed.
 - **Sudo kept alive** — type your password once; no mid-run interruptions.
 - **Honest summary** — per-stage status, counts, elapsed time, and restart detection.
 - **Full transcript** saved to `~/Library/Logs/TrueMacUpdater/`.
@@ -75,7 +76,7 @@ It's **resilient**: if one stage hits a problem, the others still run, and the s
 
 ```bash
 git clone <this repo>
-cd update-everything-on-my-mac
+cd true-mac-updater
 chmod +x TrueMacUpdater.sh
 ./TrueMacUpdater.sh --dry-run     # take it for a spin first
 ```

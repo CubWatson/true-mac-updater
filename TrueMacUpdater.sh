@@ -13,9 +13,43 @@
 # Usage:   ./TrueMacUpdater.sh [options]
 # Help:    ./TrueMacUpdater.sh --help
 #
-# This script is intentionally resilient: if one component fails, the others
-# still run, and you get an honest summary at the end.
+# ─────────────────────────────────────────────────────────────────────────────
+#  How this script is organized (a map for contributors)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#   main()                  entry point; wires everything together in order
+#    ├─ parse_args()        turn CLI flags into the DO_* / *_RUN globals
+#    ├─ setup_colors()      decide whether to emit ANSI color
+#    ├─ setup_logging()     tee the whole run to ~/Library/Logs (unless --no-log)
+#    ├─ preflight()         sanity-check the machine, print the header
+#    ├─ stage_homebrew()    Stage 1 — brew update / upgrade / cleanup
+#    ├─ stage_appstore()    Stage 2 — Mac App Store apps, via `mas`
+#    ├─ stage_system()      Stage 3 — macOS system & security updates
+#    └─ print_summary()     the final pass/fail table + exit code
+#
+#  Design principles, so changes stay consistent:
+#
+#   • Resilient, not fail-fast. A stage NEVER aborts the script. Instead each
+#     stage records its outcome in a <STAGE>_RESULT global ("ok"/"failed"/
+#     "skipped") and bumps FAILURES on trouble. main() exits non-zero at the end
+#     iff FAILURES > 0. This is why we deliberately do NOT use `set -e`.
+#
+#   • Honest reporting. We only claim success when the thing actually happened.
+#     The summary reflects reality even when individual steps go sideways.
+#
+#   • --dry-run changes nothing. Every code path that would mutate the system is
+#     guarded by a DRY_RUN check that prints "would do X" instead.
+#
+#   • bash 3.2 compatible. macOS still ships bash 3.2, so: no associative arrays,
+#     no `${var^^}`, no `mapfile`. Keep it portable.
+#
+#   • Talk to the user through the helpers (info/step/ok/warn/err/note), not raw
+#     `echo`, so coloring and formatting stay uniform.
 
+# Shell safety options:
+#   -u            error on use of an unset variable (catches typos early)
+#   -o pipefail   a pipeline fails if ANY stage fails, not just the last one
+# Note: `-e` is intentionally omitted — see "Resilient, not fail-fast" above.
 set -uo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -25,41 +59,55 @@ readonly VERSION="2.0.0"
 readonly SELF_NAME="TrueMacUpdater"
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Configuration (overridable by flags)
+#  Configuration — these are the defaults; parse_args() flips them from flags
 # ─────────────────────────────────────────────────────────────────────────────
-DO_BREW=true
-DO_APPSTORE=true
-DO_SYSTEM=true
-DO_CLEANUP=true
-DO_TRUST=true
-DRY_RUN=false
-ASSUME_YES=false
-USE_COLOR=true
-USE_LOG=true
-AUTO_RESTART=false
+DO_BREW=true          # run the Homebrew stage          (--skip-brew)
+DO_APPSTORE=true      # run the App Store stage          (--skip-appstore)
+DO_SYSTEM=true        # run the macOS system-update stage (--skip-system)
+DO_CLEANUP=true       # run `brew cleanup` after upgrades (--no-cleanup)
+DO_TRUST=true         # auto-trust third-party-tap packages (--no-trust)
+DRY_RUN=false         # preview only, mutate nothing      (-n / --dry-run)
+ASSUME_YES=false      # answer "yes" to every prompt      (-y / --yes)
+USE_COLOR=true        # emit ANSI color                   (--no-color)
+USE_LOG=true          # write a transcript to ~/Library/Logs (--no-log)
+AUTO_RESTART=false    # reboot automatically if macOS asks (-r / --restart)
 
-# Detect TTY *before* we possibly redirect stdout into a log pipe.
+# Whether stdout is a real terminal. We capture this *before* setup_logging()
+# may redirect stdout into a `tee` pipe — past that point `[[ -t 1 ]]` would
+# wrongly report "not a TTY" and we'd lose color and interactive prompts.
 STDOUT_IS_TTY=false
 [[ -t 1 ]] && STDOUT_IS_TTY=true
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Summary state (no associative arrays — keep macOS bash 3.2 happy)
+#  Summary state — each stage writes here; print_summary() reads it at the end.
+#  Plain scalars only (no associative arrays) to stay bash 3.2 compatible.
 # ─────────────────────────────────────────────────────────────────────────────
-BREW_RESULT="skipped"
+BREW_RESULT="skipped"      # "ok" | "failed" | "skipped" — outcome of each stage
 APPSTORE_RESULT="skipped"
 SYSTEM_RESULT="skipped"
-BREW_COUNT=0
+BREW_COUNT=0               # how many updates each stage found (for the summary)
 APPSTORE_COUNT=0
 SYSTEM_COUNT=0
-RESTART_REQUIRED=false
-FAILURES=0
-START_TS=$(date +%s)
-LOG_FILE=""
+RESTART_REQUIRED=false     # set true if a macOS update needs a reboot to finish
+FAILURES=0                 # number of stages that hit trouble; drives exit code
+START_TS=$(date +%s)       # wall-clock start, so the summary can show duration
+LOG_FILE=""                # path to the transcript, filled in by setup_logging()
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  Output helpers
+#
+#  All user-facing text goes through these so the look stays consistent. Pick by
+#  intent, not by color:
+#    info  •  a neutral fact            step  →  an action we're about to take
+#    ok    ✓  something succeeded        warn  !  a non-fatal problem
+#    err   ✗  a fatal/important error    note     dimmed secondary detail
+#  The color variables are filled in by setup_colors() (empty when color is off).
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Populate the color globals — but only when output is a real terminal, color
+# wasn't disabled (--no-color), and the user hasn't set NO_COLOR (a cross-tool
+# convention; see no-color.org). Otherwise every color var becomes empty, so the
+# same printf calls emit clean, plain text into pipes and log files.
 setup_colors() {
   if [[ "$USE_COLOR" == true && "$STDOUT_IS_TTY" == true && -z "${NO_COLOR:-}" ]]; then
     BOLD=$'\033[1m'; DIM=$'\033[2m'
@@ -72,15 +120,19 @@ setup_colors() {
   fi
 }
 
-# A horizontal rule that adapts to terminal width (capped for readability).
+# Print a horizontal rule that spans the terminal width, capped at 74 columns so
+# it stays readable on very wide windows. Falls back to 72 if `tput` can't tell
+# us the width (e.g. when piped).
 rule() {
   local cols width line
   cols=$( { tput cols; } 2>/dev/null || echo 72 )
   width=$(( cols < 74 ? cols : 74 ))
-  line=$(printf '─%.0s' $(seq 1 "$width"))
+  line=$(printf '─%.0s' $(seq 1 "$width"))   # repeat "─" `width` times
   printf '%s%s%s\n' "$DIM" "$line" "$NC"
 }
 
+# Print a titled section header (blank line + rule + bold title + rule). Used to
+# visually separate the stages in the output.
 section() {
   echo ""
   rule
@@ -95,12 +147,19 @@ warn()  { printf '%s!%s %s\n'  "$YELLOW"  "$NC" "$*"; }
 err()   { printf '%s✗%s %s\n'  "$RED"     "$NC" "$*" >&2; }
 note()  { printf '  %s%s%s\n'  "$DIM"     "$*" "$NC"; }
 
+# Print an error and abort the whole script. Reserved for unrecoverable setup
+# problems (wrong OS, etc.) — individual stages report failure instead of dying.
 die() {
   err "$*"
   exit 1
 }
 
-# Ask a yes/no question. Honors --yes. Default is the second arg (Y/n).
+# Ask a yes/no question and return 0 for yes, 1 for no.
+#   $1  prompt text
+#   $2  default taken on empty input — "Y" (default) or "N"
+# Auto-answers in two cases so the script never hangs: --yes forces yes, and a
+# non-interactive run (no TTY, e.g. piped or cron) also returns yes so unattended
+# use isn't blocked waiting on a prompt.
 confirm() {
   local prompt="$1" default="${2:-Y}" reply hint="[Y/n]"
   [[ "$ASSUME_YES" == true ]] && return 0
@@ -117,6 +176,9 @@ confirm() {
 #  Help / version
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Print the --help text. Uses an *unquoted* heredoc so the ${BOLD}/${NC} color
+# variables are expanded. If you add or rename a flag, update both this text and
+# the case statement in parse_args() so they stay in sync.
 print_help() {
   cat <<EOF
 ${BOLD}${SELF_NAME}${NC} v${VERSION} — update your entire Mac with one command.
@@ -157,6 +219,10 @@ EOF
 #  Argument parsing
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Translate command-line flags into the configuration globals defined up top.
+# Unknown flags exit with code 2. -h/-v are handled here because they short-
+# circuit the whole run. To add an option: add a case branch here, a default
+# global above, and a line in print_help().
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -182,12 +248,19 @@ parse_args() {
 #  Logging — tee a full transcript while keeping the screen readable
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Start mirroring all output to a timestamped transcript under ~/Library/Logs.
+# Skipped for --no-log and --dry-run (a preview isn't worth a log file). If the
+# log directory can't be created we silently fall back to screen-only output
+# rather than failing the run.
 setup_logging() {
   [[ "$USE_LOG" != true || "$DRY_RUN" == true ]] && { USE_LOG=false; return 0; }
   local dir="${HOME}/Library/Logs/${SELF_NAME}"
   mkdir -p "$dir" 2>/dev/null || { USE_LOG=false; return 0; }
   LOG_FILE="${dir}/$(date +%Y-%m-%d_%H%M%S).log"
-  # Send everything to both the screen and the log file.
+  # Redirect this shell's stdout through `tee` so every subsequent line is both
+  # printed to the screen and appended to the log; `2>&1` folds stderr in too.
+  # `> >(...)` is process substitution — `tee` runs as a parallel process whose
+  # input is our stdout. Done once here, it covers the entire rest of the run.
   exec > >(tee -a "$LOG_FILE") 2>&1
 }
 
@@ -195,6 +268,9 @@ setup_logging() {
 #  Pre-flight checks
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Verify we're on a supported machine and print the run header (OS, host, user,
+# log path). Hard-stops on non-macOS; only warns (and asks) on non-arm64, since
+# the tool can still mostly work on Intel even though it's tuned for Apple Silicon.
 preflight() {
   [[ "$(uname -s)" == "Darwin" ]] || die "This script only runs on macOS."
 
@@ -214,28 +290,41 @@ preflight() {
   [[ "$DRY_RUN" == true ]] && warn "DRY RUN — nothing will actually be changed."
 }
 
-# Keep sudo alive for the whole run so macOS updates don't stall on a prompt.
+# Acquire admin rights once and keep them warm for the rest of the run, so a long
+# `softwareupdate` install doesn't suddenly block on a password prompt halfway
+# through. PID of the background refresher is stored so cleanup_on_exit() can
+# stop it. Returns 1 if the user fails/declines the initial sudo prompt.
 SUDO_KEEPALIVE_PID=""
 ensure_sudo() {
   [[ "$DRY_RUN" == true ]] && return 0
   step "macOS updates need administrator access."
   sudo -v || return 1
-  # Refresh the sudo timestamp in the background until this script exits.
+  # Re-validate the sudo timestamp every 50s (under the default 5-min timeout) in
+  # the background. `kill -0 "$$"` checks our own PID is still alive and exits the
+  # loop once the main script is gone, so this never becomes an orphan.
   ( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
   SUDO_KEEPALIVE_PID=$!
   return 0
 }
 
+# Stop the sudo-keepalive background loop. Registered on EXIT so it runs no
+# matter how the script ends (normal finish, error, or Ctrl-C).
 cleanup_on_exit() {
   [[ -n "$SUDO_KEEPALIVE_PID" ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
 }
 trap cleanup_on_exit EXIT
+# On Ctrl-C / kill, print a tidy message and exit 130 (the conventional
+# "terminated by SIGINT" code); the EXIT trap above still fires for cleanup.
 trap 'echo; warn "Interrupted. Cleaning up…"; exit 130' INT TERM
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  Stage 1 — Homebrew
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Make sure `brew` is callable, returning 0 if it is and 1 if it can't be found.
+# A non-login shell (the usual case for a script) often hasn't sourced Homebrew's
+# environment, so if brew isn't on PATH we try the standard Apple Silicon install
+# location and load its shellenv before giving up.
 ensure_brew_on_path() {
   command -v brew >/dev/null 2>&1 && return 0
   if [[ -x /opt/homebrew/bin/brew ]]; then
@@ -244,6 +333,8 @@ ensure_brew_on_path() {
   command -v brew >/dev/null 2>&1
 }
 
+# Offer to install Homebrew via its official installer. Returns 1 if the user
+# declines or the install fails. Only reached when brew is genuinely missing.
 install_homebrew() {
   confirm "Homebrew isn't installed. Install it now?" "Y" || return 1
   info "Installing Homebrew (runs Homebrew's official installer)…"
@@ -308,6 +399,54 @@ $entries
 EOF
 }
 
+# After a failed 'brew upgrade', some "failures" are not failures at all: a
+# formula's final `brew link` step can collide with files a cask already owns
+# (classically the `docker` formula vs the `docker-desktop` cask — both ship
+# docker shell completions). The package itself upgrades fine; only the symlink
+# step loses the race. Homebrew prints the exact remedy — 'brew link --overwrite
+# <formula>' — so we parse it back out of the captured output and run it for each
+# affected formula.
+#
+# Returns success only when *every* error in this upgrade was such a link
+# conflict and we resolved them all, so a genuine upgrade failure (a download
+# error, a build error, …) still fails the stage honestly.
+brew_recover_link_conflicts() {
+  local log="$1" formulae f resolved=true total_errors link_errors
+
+  formulae=$(grep -oE 'brew link --overwrite [A-Za-z0-9@._+-]+' "$log" 2>/dev/null \
+               | awk '{print $NF}' | sort -u)
+  [[ -z "$formulae" ]] && return 1
+
+  # Bail out (report failure) if brew also failed for any reason that isn't a
+  # link-step conflict, so we never paper over a real problem.
+  total_errors=$(grep -c '^Error:' "$log" 2>/dev/null); total_errors=${total_errors:-0}
+  link_errors=$(grep -c 'step did not complete' "$log" 2>/dev/null); link_errors=${link_errors:-0}
+  [[ "$total_errors" -le "$link_errors" ]] || return 1
+
+  step "A formula's link step conflicted with a cask's files; relinking with --overwrite…"
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    if brew link --overwrite "$f" >/dev/null 2>&1; then
+      note "relinked ${f}"
+    else
+      resolved=false
+      warn "Couldn't relink ${f} (try 'brew link --overwrite ${f}' manually)."
+    fi
+  done <<EOF
+$formulae
+EOF
+
+  [[ "$resolved" == true ]]
+}
+
+# Stage 1 — Homebrew. Flow:
+#   1. ensure brew exists (offer to install it if not)
+#   2. `brew update`            refresh the catalog
+#   3. trust third-party taps   so step 4 doesn't skip them (unless --no-trust)
+#   4. `brew outdated`          count what needs upgrading (also drives summary)
+#   5. `brew upgrade`           upgrade formulae + casks, recovering link conflicts
+#   6. `brew cleanup`           prune old versions (unless --no-cleanup)
+# Records the outcome in BREW_RESULT / BREW_COUNT for the summary.
 stage_homebrew() {
   section "1 · Homebrew"
 
@@ -339,6 +478,8 @@ stage_homebrew() {
   # Grab the outdated list once; 'brew upgrade' also covers outdated casks.
   local outdated
   outdated=$(brew outdated 2>/dev/null || true)
+  # `grep -c .` counts non-empty lines = number of outdated packages. The `|| true`
+  # keeps a zero count (grep exits 1 when nothing matches) from tripping pipefail.
   BREW_COUNT=$(printf '%s' "$outdated" | grep -c . || true)
   BREW_COUNT=${BREW_COUNT:-0}
 
@@ -354,19 +495,31 @@ stage_homebrew() {
       BREW_RESULT="ok"
     elif confirm "Upgrade these now?" "Y"; then
       step "Upgrading formulae & casks (casks may ask for your password)…"
-      if brew upgrade; then
+      # Keep a copy of the upgrade output (still shown on screen and in the log
+      # via the global tee) so we can recognize — and recover from — a benign
+      # 'brew link' conflict without re-running the whole upgrade.
+      local upgrade_log
+      upgrade_log=$(mktemp -t "${SELF_NAME}" 2>/dev/null) || upgrade_log="/dev/null"
+      if brew upgrade 2>&1 | tee "$upgrade_log"; then
         ok "Homebrew packages upgraded."
+        BREW_RESULT="ok"
+      elif brew_recover_link_conflicts "$upgrade_log"; then
+        ok "Homebrew packages upgraded (resolved a link conflict)."
         BREW_RESULT="ok"
       else
         warn "Some Homebrew upgrades failed (see output above)."
         BREW_RESULT="failed"; FAILURES=$((FAILURES + 1))
       fi
+      [[ "$upgrade_log" != "/dev/null" ]] && rm -f "$upgrade_log"
     else
       note "Skipped by choice."
       BREW_RESULT="ok"
     fi
   fi
 
+  # Reclaim disk space by removing outdated downloads and old keg versions.
+  # `--prune=all` drops every cached download regardless of age. Output is hidden
+  # (it's noisy and purely informational) unless something goes wrong.
   if [[ "$DO_CLEANUP" == true && "$DRY_RUN" == false ]]; then
     step "Cleaning up old versions & caches…"
     if brew cleanup --prune=all >/dev/null 2>&1; then ok "Cleanup done."; else warn "Cleanup had issues."; fi
@@ -377,6 +530,11 @@ stage_homebrew() {
 #  Stage 2 — App Store (mas)
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Stage 2 — Mac App Store, driven by the `mas` CLI (https://github.com/mas-cli/mas).
+# If `mas` isn't installed we try to add it via Homebrew first. Note: `mas` can
+# only upgrade apps tied to the currently signed-in Apple ID, so a failure here
+# is often just "not signed in to the App Store" rather than a real error.
+# Records the outcome in APPSTORE_RESULT / APPSTORE_COUNT.
 stage_appstore() {
   section "2 · App Store"
 
@@ -436,10 +594,17 @@ stage_appstore() {
 #  Stage 3 — macOS system updates
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Stage 3 — macOS system & security updates, via Apple's `softwareupdate` tool.
+# This is the only stage that needs sudo, and the only one that can trigger a
+# reboot, so it's deliberately handled last. We parse `softwareupdate --list`
+# both to count updates and to detect whether any of them require a restart.
+# Records the outcome in SYSTEM_RESULT / SYSTEM_COUNT (and may set RESTART_REQUIRED).
 stage_system() {
   section "3 · macOS System Updates"
 
   step "Scanning for system & security updates…"
+  # `softwareupdate --list` prints to stderr on some macOS versions, so fold
+  # stderr in (2>&1) to capture the listing reliably; `|| true` ignores its exit.
   local list
   list=$(softwareupdate --list 2>&1 || true)
 
@@ -502,8 +667,11 @@ stage_system() {
 #  Summary
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Print one line of the summary table, mapping a result string to an icon+color.
+#   $1  label   (e.g. "Homebrew")
+#   $2  result  ("ok" | "failed" | "skipped"; anything else renders as "?")
+#   $3  extra   trailing dimmed detail (e.g. "3 update(s)")
 row() {
-  # row <label> <result> <extra>
   local label="$1" result="$2" extra="${3:-}" icon color
   case "$result" in
     ok)      icon="✓"; color="$GREEN" ;;
@@ -514,6 +682,9 @@ row() {
   printf '  %s%s%s  %-11s %s%s%s\n' "$color" "$icon" "$NC" "$label" "$DIM" "$extra" "$NC"
 }
 
+# Print the final report: per-stage pass/fail table, elapsed time, transcript
+# path, an overall verdict, and (if needed) the reboot prompt. Reads all the
+# *_RESULT / *_COUNT / FAILURES / RESTART_REQUIRED globals the stages filled in.
 print_summary() {
   local end_ts elapsed mins secs
   end_ts=$(date +%s)
@@ -522,6 +693,8 @@ print_summary() {
 
   section "Summary"
 
+  # A stage that was turned off via a --skip flag shows as "disabled" rather than
+  # its (never-updated) default result, so the report matches what actually ran.
   local brew_extra appstore_extra system_extra
   if [[ "$DO_BREW" == true ]]; then brew_extra="${BREW_COUNT} update(s)"; else BREW_RESULT="skipped"; brew_extra="disabled"; fi
   if [[ "$DO_APPSTORE" == true ]]; then appstore_extra="${APPSTORE_COUNT} update(s)"; else APPSTORE_RESULT="skipped"; appstore_extra="disabled"; fi
@@ -559,6 +732,8 @@ print_summary() {
 #  Banner
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Print the ASCII-art splash. The heredoc is single-quoted ('EOF') so the
+# backslashes in the art aren't treated as escapes; color is applied around it.
 banner() {
   printf '%s%s' "$BOLD" "$CYAN"
   cat <<'EOF'
@@ -576,6 +751,10 @@ EOF
 #  Main
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Entry point. Order matters: parse flags first (they configure everything),
+# set up color/logging before any output, run pre-flight, then the three stages
+# (each gated by its DO_* flag), and finally the summary. Exit non-zero if any
+# stage reported a failure, so callers and CI can detect trouble.
 main() {
   parse_args "$@"
   setup_colors
@@ -595,4 +774,5 @@ main() {
   exit 0
 }
 
+# Pass the script's arguments straight through to main().
 main "$@"
