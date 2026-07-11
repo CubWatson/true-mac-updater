@@ -291,13 +291,17 @@ preflight() {
 }
 
 # Acquire admin rights once and keep them warm for the rest of the run, so a long
-# `softwareupdate` install doesn't suddenly block on a password prompt halfway
-# through. PID of the background refresher is stored so cleanup_on_exit() can
-# stop it. Returns 1 if the user fails/declines the initial sudo prompt.
+# install doesn't suddenly block on a password prompt halfway through. Both the
+# App Store stage (mas 7 runs updates as root) and the macOS stage need this;
+# calling it again is a cheap no-op once the keepalive is running. PID of the
+# background refresher is stored so cleanup_on_exit() can stop it. Returns 1 if
+# the user fails/declines the initial sudo prompt.
+#   $1  the reason to show the user before the password prompt
 SUDO_KEEPALIVE_PID=""
 ensure_sudo() {
   [[ "$DRY_RUN" == true ]] && return 0
-  step "macOS updates need administrator access."
+  [[ -n "$SUDO_KEEPALIVE_PID" ]] && return 0  # already acquired earlier this run
+  step "${1:-Administrator access is required.}"
   sudo -v || return 1
   # Re-validate the sudo timestamp every 50s (under the default 5-min timeout) in
   # the background. `kill -0 "$$"` checks our own PID is still alive and exits the
@@ -439,12 +443,78 @@ EOF
   [[ "$resolved" == true ]]
 }
 
+# Turn `brew outdated --json=v2` output into "<--formula|--cask>\t<name>" lines,
+# so the upgrade loop knows which flag each package needs. The JSON form is more
+# robust than counting text lines, and it's the only output that distinguishes
+# formulae from casks. Parsed with grep/sed rather than jq (not present on macOS
+# before 15): everything before the "casks" key is the formulae half, everything
+# after it is the casks half, and each entry has exactly one "name" key.
+brew_outdated_entries() {
+  local json="$1" formulae_half casks_half
+  formulae_half=${json%%'"casks"'*}
+  casks_half=${json#*'"casks"'}
+  # No "casks" key at all (unexpected shape): don't let both halves fall back to
+  # the whole string, or every formula would also be listed as a cask.
+  case "$json" in *'"casks"'*) ;; *) casks_half="" ;; esac
+
+  printf '%s' "$formulae_half" \
+    | grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | sed 's/.*"\([^"]*\)"/\1/' \
+    | awk '{ print "--formula\t" $0 }'
+  printf '%s' "$casks_half" \
+    | grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | sed 's/.*"\([^"]*\)"/\1/' \
+    | awk '{ print "--cask\t" $0 }'
+}
+
+# Upgrade packages one at a time (entries: "<flag>\t<name>" lines) instead of one
+# monolithic 'brew upgrade'. That buys a real [n/N] counter, per-package pass/
+# fail instead of an all-or-nothing stage result, and link-conflict recovery that
+# only ever deals with one formula at a time. Slightly slower than brew's
+# internal batching — the visibility is worth it. Sets BREW_RESULT / FAILURES.
+brew_upgrade_each() {
+  local entries="$1" flag name idx=0 failed=0 upgrade_log
+  upgrade_log=$(mktemp -t "${SELF_NAME}" 2>/dev/null) || upgrade_log="/dev/null"
+
+  # The list is fed on fd 3 so brew keeps its own stdin. HOMEBREW_NO_AUTO_UPDATE
+  # stops every single call from re-running the catalog auto-update — we already
+  # ran 'brew update' once up front.
+  while IFS=$'\t' read -r -u 3 flag name; do
+    [[ -z "$name" ]] && continue
+    idx=$((idx + 1))
+    step "[${idx}/${BREW_COUNT}] Upgrading ${name}…"
+    # Keep a copy of the output (still shown on screen and in the log via the
+    # global tee) so we can recognize — and recover from — a benign 'brew link'
+    # conflict without re-running the upgrade.
+    if HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade "$flag" "$name" 2>&1 | tee "$upgrade_log"; then
+      : # upgraded cleanly
+    elif brew_recover_link_conflicts "$upgrade_log"; then
+      ok "${name} upgraded (resolved a link conflict)."
+    else
+      warn "Upgrade of ${name} failed (see output above)."
+      failed=$((failed + 1))
+    fi
+  done 3<<EOF
+$entries
+EOF
+
+  [[ "$upgrade_log" != "/dev/null" ]] && rm -f "$upgrade_log"
+
+  if [[ "$failed" -eq 0 ]]; then
+    ok "All ${BREW_COUNT} Homebrew package(s) upgraded."
+    BREW_RESULT="ok"
+  else
+    warn "${failed} of ${BREW_COUNT} Homebrew upgrade(s) failed."
+    BREW_RESULT="failed"; FAILURES=$((FAILURES + 1))
+  fi
+}
+
 # Stage 1 — Homebrew. Flow:
 #   1. ensure brew exists (offer to install it if not)
 #   2. `brew update`            refresh the catalog
 #   3. trust third-party taps   so step 4 doesn't skip them (unless --no-trust)
-#   4. `brew outdated`          count what needs upgrading (also drives summary)
-#   5. `brew upgrade`           upgrade formulae + casks, recovering link conflicts
+#   4. `brew outdated`          list what needs upgrading (text + JSON forms)
+#   5. `brew upgrade <pkg>`     one package at a time, with an [n/N] counter
 #   6. `brew cleanup`           prune old versions (unless --no-cleanup)
 # Records the outcome in BREW_RESULT / BREW_COUNT for the summary.
 stage_homebrew() {
@@ -475,12 +545,14 @@ stage_homebrew() {
   # load them, so 'brew outdated'/'brew upgrade' don't silently skip them.
   [[ "$DO_TRUST" == true ]] && trust_installed_packages
 
-  # Grab the outdated list once; 'brew upgrade' also covers outdated casks.
-  local outdated
+  # Grab the outdated list in both forms: the plain text for the human-readable
+  # listing (it shows versions), and --json=v2 to drive the upgrade loop.
+  local outdated entries
   outdated=$(brew outdated 2>/dev/null || true)
+  entries=$(brew_outdated_entries "$(brew outdated --json=v2 2>/dev/null || true)")
   # `grep -c .` counts non-empty lines = number of outdated packages. The `|| true`
   # keeps a zero count (grep exits 1 when nothing matches) from tripping pipefail.
-  BREW_COUNT=$(printf '%s' "$outdated" | grep -c . || true)
+  BREW_COUNT=$(printf '%s' "$entries" | grep -c . || true)
   BREW_COUNT=${BREW_COUNT:-0}
 
   if [[ "$BREW_COUNT" -eq 0 ]]; then
@@ -491,26 +563,11 @@ stage_homebrew() {
     printf '%s\n' "$outdated" | sed 's/^/    /'
     echo ""
     if [[ "$DRY_RUN" == true ]]; then
-      note "Dry run: would run 'brew upgrade' (formulae + casks)."
+      note "Dry run: would upgrade these one at a time with 'brew upgrade <package>'."
       BREW_RESULT="ok"
     elif confirm "Upgrade these now?" "Y"; then
       step "Upgrading formulae & casks (casks may ask for your password)…"
-      # Keep a copy of the upgrade output (still shown on screen and in the log
-      # via the global tee) so we can recognize — and recover from — a benign
-      # 'brew link' conflict without re-running the whole upgrade.
-      local upgrade_log
-      upgrade_log=$(mktemp -t "${SELF_NAME}" 2>/dev/null) || upgrade_log="/dev/null"
-      if brew upgrade 2>&1 | tee "$upgrade_log"; then
-        ok "Homebrew packages upgraded."
-        BREW_RESULT="ok"
-      elif brew_recover_link_conflicts "$upgrade_log"; then
-        ok "Homebrew packages upgraded (resolved a link conflict)."
-        BREW_RESULT="ok"
-      else
-        warn "Some Homebrew upgrades failed (see output above)."
-        BREW_RESULT="failed"; FAILURES=$((FAILURES + 1))
-      fi
-      [[ "$upgrade_log" != "/dev/null" ]] && rm -f "$upgrade_log"
+      brew_upgrade_each "$entries"
     else
       note "Skipped by choice."
       BREW_RESULT="ok"
@@ -530,10 +587,99 @@ stage_homebrew() {
 #  Stage 2 — App Store (mas)
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Pull one string field out of a single-line JSON object ('"key":"value"').
+# The [,{] anchor before the key keeps e.g. "displayName" from matching "name".
+# Values containing escaped quotes get cut short — fine for the app names and
+# paths we read in practice, and it keeps us free of a jq dependency.
+#   $1  the JSON line   $2  the key
+json_str_field() {
+  printf '%s' "$1" | sed -n 's/.*[,{]"'"$2"'":"\([^"]*\)".*/\1/p'
+}
+
+# Turn `mas outdated --json` output (one JSON object per line, mas 7) into
+# "<id>\t<name>\t<installed>\t<new>\t<path>" records for the update loop.
+# Reads stdin; lines without an adamID (e.g. blank) are skipped.
+mas_outdated_entries() {
+  local line id name installed new path
+  while IFS= read -r line; do
+    case "$line" in *'"adamID"'*) ;; *) continue ;; esac
+    id=$(printf '%s' "$line" | sed -n 's/.*[,{]"adamID":\([0-9][0-9]*\).*/\1/p')
+    [[ -z "$id" ]] && continue
+    name=$(json_str_field "$line" "name")
+    installed=$(json_str_field "$line" "version")
+    new=$(json_str_field "$line" "newVersion")
+    path=$(json_str_field "$line" "path")
+    printf '%s\t%s\t%s\t%s\t%s\n' "$id" "${name:-app-$id}" "$installed" "$new" "$path"
+  done
+}
+
+# Read an app bundle's version straight from disk. This is the ground truth for
+# "did this update actually land" — mas's exit code can be wrong in both
+# directions, so we check the Info.plist instead of trusting it.
+app_bundle_version() {
+  defaults read "$1/Contents/Info" CFBundleShortVersionString 2>/dev/null
+}
+
+# Update apps one at a time (entries: records from mas_outdated_entries) instead
+# of one opaque 'mas upgrade': a real [n/N] counter plus per-app verification.
+# After each update we poll the app bundle on disk until it reports the expected
+# version (installs can take a moment to settle after mas returns).
+# Sets APPSTORE_RESULT / FAILURES.
+mas_update_each() {
+  local entries="$1" id name installed new path idx=0 failed=0
+  local mas_ok actual tries
+
+  # The list is fed on fd 3 so mas keeps its own stdin.
+  while IFS=$'\t' read -r -u 3 id name installed new path; do
+    [[ -z "$id" ]] && continue
+    idx=$((idx + 1))
+    step "[${idx}/${APPSTORE_COUNT}] Updating ${name} (${installed} → ${new})…"
+    mas_ok=true
+    sudo mas update "$id" || mas_ok=false
+
+    # Verify on disk. When mas claims success, give the install up to ~15s to
+    # settle; when it claims failure, one quick re-check is enough.
+    actual=""
+    if [[ -n "$path" ]]; then
+      tries=5
+      [[ "$mas_ok" == false ]] && tries=2
+      while [[ "$tries" -gt 0 ]]; do
+        actual=$(app_bundle_version "$path")
+        [[ "$actual" == "$new" ]] && break
+        tries=$((tries - 1))
+        [[ "$tries" -gt 0 ]] && sleep 3
+      done
+    fi
+
+    if [[ -n "$actual" && "$actual" == "$new" ]]; then
+      [[ "$mas_ok" == false ]] && note "mas reported an error, but the bundle is at ${new} — counting it as updated."
+      ok "${name} is now ${new}."
+    elif [[ -z "$actual" && "$mas_ok" == true ]]; then
+      # Bundle unreadable (moved? renamed?) — fall back to mas's own verdict.
+      note "Couldn't verify ${name} on disk; trusting mas's success report."
+      ok "${name} updated."
+    else
+      warn "${name} still reports version ${actual:-unknown} (expected ${new})."
+      failed=$((failed + 1))
+    fi
+  done 3<<EOF
+$entries
+EOF
+
+  if [[ "$failed" -eq 0 ]]; then
+    ok "All ${APPSTORE_COUNT} App Store app(s) updated."
+    APPSTORE_RESULT="ok"
+  else
+    warn "${failed} of ${APPSTORE_COUNT} App Store update(s) failed (are you signed in to the App Store?)."
+    APPSTORE_RESULT="failed"; FAILURES=$((FAILURES + 1))
+  fi
+}
+
 # Stage 2 — Mac App Store, driven by the `mas` CLI (https://github.com/mas-cli/mas).
 # If `mas` isn't installed we try to add it via Homebrew first. Note: `mas` can
 # only upgrade apps tied to the currently signed-in Apple ID, so a failure here
-# is often just "not signed in to the App Store" rather than a real error.
+# is often just "not signed in to the App Store" rather than a real error, and
+# mas 7 runs updates as root, so this stage acquires sudo before its loop.
 # Records the outcome in APPSTORE_RESULT / APPSTORE_COUNT.
 stage_appstore() {
   section "2 · App Store"
@@ -556,9 +702,9 @@ stage_appstore() {
   fi
 
   step "Checking for App Store updates…"
-  local outdated
-  outdated=$(mas outdated 2>/dev/null || true)
-  APPSTORE_COUNT=$(printf '%s' "$outdated" | grep -c . || true)
+  local entries
+  entries=$(mas outdated --json 2>/dev/null | mas_outdated_entries)
+  APPSTORE_COUNT=$(printf '%s' "$entries" | grep -c . || true)
   APPSTORE_COUNT=${APPSTORE_COUNT:-0}
 
   if [[ "$APPSTORE_COUNT" -eq 0 ]]; then
@@ -567,23 +713,20 @@ stage_appstore() {
   fi
 
   info "${APPSTORE_COUNT} App Store app(s) can be updated:"
-  printf '%s\n' "$outdated" | sed 's/^/    /'
+  printf '%s\n' "$entries" | awk -F'\t' '{ printf "    %s  %s → %s\n", $2, $3, $4 }'
   echo ""
 
   if [[ "$DRY_RUN" == true ]]; then
-    note "Dry run: would run 'mas upgrade'."
+    note "Dry run: would update these one at a time with 'sudo mas update <app-id>'."
     APPSTORE_RESULT="ok"; return
   fi
 
   if confirm "Update these App Store apps now?" "Y"; then
-    step "Downloading & installing App Store updates…"
-    if mas upgrade; then
-      ok "App Store apps updated."
-      APPSTORE_RESULT="ok"
-    else
-      warn "Some App Store updates failed (are you signed in to the App Store?)."
-      APPSTORE_RESULT="failed"; FAILURES=$((FAILURES + 1))
+    if ! ensure_sudo "App Store updates need administrator access (mas 7 installs as root)."; then
+      err "Administrator access denied — skipping App Store updates."
+      APPSTORE_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
     fi
+    mas_update_each "$entries"
   else
     note "Skipped by choice."
     APPSTORE_RESULT="ok"
@@ -595,8 +738,8 @@ stage_appstore() {
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Stage 3 — macOS system & security updates, via Apple's `softwareupdate` tool.
-# This is the only stage that needs sudo, and the only one that can trigger a
-# reboot, so it's deliberately handled last. We parse `softwareupdate --list`
+# This is the only stage that can trigger a reboot, so it's deliberately handled
+# last (it shares sudo with stage 2). We parse `softwareupdate --list`
 # both to count updates and to detect whether any of them require a restart.
 # Records the outcome in SYSTEM_RESULT / SYSTEM_COUNT (and may set RESTART_REQUIRED).
 stage_system() {
@@ -642,7 +785,7 @@ stage_system() {
     SYSTEM_RESULT="ok"; return
   fi
 
-  if ! ensure_sudo; then
+  if ! ensure_sudo "macOS updates need administrator access."; then
     err "Administrator access denied — skipping system updates."
     SYSTEM_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
   fi
