@@ -173,6 +173,109 @@ confirm() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  Status area — a live stage list pinned to the bottom of the terminal
+#
+#  While a stage's raw output (brew's compile scroll, mas's download chatter)
+#  flows past above, a small pinned area keeps every stage's state and counter
+#  in view. Mechanics: the bottom STATUS_ROWS rows are fenced off with a scroll
+#  region (DECSTBM), and each redraw saves the cursor (ESC 7), repaints those
+#  rows, and restores it (ESC 8). Everything is written to /dev/tty, never
+#  stdout, so the escape codes stay out of the transcript and the log tee.
+#
+#  When stdout isn't a TTY (cron, pipes, CI), STATUS_ENABLED stays false, every
+#  function here is a no-op, and the plain line-per-event output stands alone.
+# ═════════════════════════════════════════════════════════════════════════════
+
+STATUS_ENABLED=false
+STATUS_ROWS=4          # 1 separator rule + one line per stage
+STATUS_TERM_LINES=0    # terminal height captured at init (resizes aren't tracked)
+STATUS_BREW="waiting"
+STATUS_APPSTORE="waiting"
+STATUS_SYSTEM="waiting"
+
+# Fence off the bottom rows and turn the pinned area on. Quietly does nothing
+# without a TTY, or on terminals too short to give up four rows. The newlines
+# scroll existing output up first so nothing gets painted over.
+status_init() {
+  [[ "$STDOUT_IS_TTY" == true ]] || return 0
+  STATUS_TERM_LINES=$( { tput lines; } 2>/dev/null || echo 0 )
+  [[ "$STATUS_TERM_LINES" -ge 15 ]] || return 0
+  STATUS_ENABLED=true
+  {
+    printf '\n%.0s' $(seq 1 "$STATUS_ROWS")
+    printf '\033[%dA' "$STATUS_ROWS"
+    printf '\0337'
+    printf '\033[1;%dr' $(( STATUS_TERM_LINES - STATUS_ROWS ))
+    printf '\0338'
+  } > /dev/tty
+  status_draw
+}
+
+# Repaint the pinned rows from the STATUS_* globals. Lines are truncated to the
+# terminal width so a long package name can't wrap and shove the layout apart.
+status_draw() {
+  [[ "$STATUS_ENABLED" == true ]] || return 0
+  local top cols row text
+  top=$(( STATUS_TERM_LINES - STATUS_ROWS + 1 ))
+  cols=$( { tput cols; } 2>/dev/null || echo 80 )
+  {
+    printf '\0337'
+    printf '\033[%d;1H\033[2K%s' "$top" "$DIM"
+    printf '─%.0s' $(seq 1 $(( cols < 74 ? cols : 74 )))
+    printf '%s' "$NC"
+    row=$(( top + 1 ))
+    for text in "1 Homebrew   ${STATUS_BREW}" \
+                "2 App Store  ${STATUS_APPSTORE}" \
+                "3 macOS      ${STATUS_SYSTEM}"; do
+      printf '\033[%d;1H\033[2K %s' "$row" "${text:0:$(( cols - 2 ))}"
+      row=$(( row + 1 ))
+    done
+    printf '\0338'
+  } > /dev/tty
+}
+
+# Update one stage's line and repaint.
+#   $1  stage key: brew | appstore | system     $2  new state text
+status_set() {
+  case "$1" in
+    brew)     STATUS_BREW="$2" ;;
+    appstore) STATUS_APPSTORE="$2" ;;
+    system)   STATUS_SYSTEM="$2" ;;
+  esac
+  status_draw
+}
+
+# Translate a finished stage's *_RESULT into its final status-area text.
+#   $1  stage key   $2  result ("ok"/"failed"/…)   $3  update count
+status_finish() {
+  local text
+  case "$2" in
+    ok)     text="✓ done · $3 update(s)" ;;
+    failed) text="✗ problems (see above)" ;;
+    *)      text="– $2" ;;
+  esac
+  status_set "$1" "$text"
+}
+
+# Erase the pinned rows and give the whole screen back to normal scrolling.
+# Called before the summary, and from cleanup_on_exit so an interrupt can't
+# leave the terminal stuck with a shrunken scroll region.
+status_close() {
+  [[ "$STATUS_ENABLED" == true ]] || return 0
+  STATUS_ENABLED=false
+  local top row
+  top=$(( STATUS_TERM_LINES - STATUS_ROWS + 1 ))
+  {
+    printf '\0337'
+    for (( row = top; row < top + STATUS_ROWS; row++ )); do
+      printf '\033[%d;1H\033[2K' "$row"
+    done
+    printf '\033[r'
+    printf '\0338'
+  } > /dev/tty
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  Help / version
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -311,9 +414,11 @@ ensure_sudo() {
   return 0
 }
 
-# Stop the sudo-keepalive background loop. Registered on EXIT so it runs no
-# matter how the script ends (normal finish, error, or Ctrl-C).
+# Restore the terminal and stop the sudo-keepalive background loop. Registered
+# on EXIT so it runs no matter how the script ends (normal finish, error, or
+# Ctrl-C).
 cleanup_on_exit() {
+  status_close
   [[ -n "$SUDO_KEEPALIVE_PID" ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
 }
 trap cleanup_on_exit EXIT
@@ -483,6 +588,7 @@ brew_upgrade_each() {
     [[ -z "$name" ]] && continue
     idx=$((idx + 1))
     step "[${idx}/${BREW_COUNT}] Upgrading ${name}…"
+    status_set brew "[${idx}/${BREW_COUNT}] upgrading ${name}…"
     # Keep a copy of the output (still shown on screen and in the log via the
     # global tee) so we can recognize — and recover from — a benign 'brew link'
     # conflict without re-running the upgrade.
@@ -634,6 +740,7 @@ mas_update_each() {
     [[ -z "$id" ]] && continue
     idx=$((idx + 1))
     step "[${idx}/${APPSTORE_COUNT}] Updating ${name} (${installed} → ${new})…"
+    status_set appstore "[${idx}/${APPSTORE_COUNT}] updating ${name}…"
     mas_ok=true
     sudo mas update "$id" || mas_ok=false
 
@@ -791,6 +898,7 @@ stage_system() {
   fi
 
   step "Installing system updates (this can take a while)…"
+  status_set system "installing ${SYSTEM_COUNT} update(s)…"
   local sw_args=(--install --all)
   if [[ "$RESTART_REQUIRED" == true && "$AUTO_RESTART" == true ]]; then
     warn "Updates will install and the Mac will RESTART automatically."
@@ -907,10 +1015,30 @@ main() {
   section "Pre-flight"
   preflight
 
-  [[ "$DO_BREW"     == true ]] && stage_homebrew
-  [[ "$DO_APPSTORE" == true ]] && stage_appstore
-  [[ "$DO_SYSTEM"   == true ]] && stage_system
+  # Pin the live status area (TTY only) now that the header is out; stages that
+  # were switched off by a --skip flag show as disabled from the start.
+  [[ "$DO_BREW"     == true ]] || STATUS_BREW="– disabled"
+  [[ "$DO_APPSTORE" == true ]] || STATUS_APPSTORE="– disabled"
+  [[ "$DO_SYSTEM"   == true ]] || STATUS_SYSTEM="– disabled"
+  status_init
 
+  if [[ "$DO_BREW" == true ]]; then
+    status_set brew "running…"
+    stage_homebrew
+    status_finish brew "$BREW_RESULT" "$BREW_COUNT"
+  fi
+  if [[ "$DO_APPSTORE" == true ]]; then
+    status_set appstore "running…"
+    stage_appstore
+    status_finish appstore "$APPSTORE_RESULT" "$APPSTORE_COUNT"
+  fi
+  if [[ "$DO_SYSTEM" == true ]]; then
+    status_set system "running…"
+    stage_system
+    status_finish system "$SYSTEM_RESULT" "$SYSTEM_COUNT"
+  fi
+
+  status_close
   print_summary
 
   [[ "$FAILURES" -gt 0 ]] && exit 1
