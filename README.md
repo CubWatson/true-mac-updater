@@ -35,6 +35,7 @@ It's **resilient**: if one stage hits a problem, the others still run, and the s
 - **No more skipped taps** — auto-trusts packages you already have installed from third-party Homebrew taps, so `brew upgrade` stops silently skipping them (Homebrew 6+). New, not-yet-installed packages still prompt you; opt out with `--no-trust`.
 - **Recovers from link conflicts** — when a formula's `brew link` step collides with files a cask already owns (classically the `docker` formula vs. the `docker-desktop` cask), it auto-runs Homebrew's own `brew link --overwrite` fix instead of failing the whole Homebrew stage. A genuine upgrade failure still reports as failed.
 - **Sudo kept alive** — type your password once; no mid-run interruptions.
+- **Done notification** — `--notify` posts a macOS notification when the run finishes, so you can tab away.
 - **Honest summary** — per-stage status, counts, elapsed time, and restart detection.
 - **Full transcript** saved to `~/Library/Logs/TrueMacUpdater/`.
 - **Color-aware** — respects `NO_COLOR` and non-interactive pipes.
@@ -60,6 +61,7 @@ It's **resilient**: if one stage hits a problem, the others still run, and the s
 | `--skip-system` | Skip the macOS system-update stage |
 | `--no-cleanup` | Don't run `brew cleanup` |
 | `--no-trust` | Don't auto-trust installed packages from third-party taps |
+| `--notify` | Post a macOS notification when the run finishes |
 | `--no-color` | Disable colored output |
 | `--no-log` | Don't write a transcript |
 | `-h, --help` | Show help |

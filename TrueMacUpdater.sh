@@ -66,6 +66,7 @@ DO_APPSTORE=true      # run the App Store stage          (--skip-appstore)
 DO_SYSTEM=true        # run the macOS system-update stage (--skip-system)
 DO_CLEANUP=true       # run `brew cleanup` after upgrades (--no-cleanup)
 DO_TRUST=true         # auto-trust third-party-tap packages (--no-trust)
+DO_NOTIFY=false       # post a notification when the run ends (--notify)
 DRY_RUN=false         # preview only, mutate nothing      (-n / --dry-run)
 ASSUME_YES=false      # answer "yes" to every prompt      (-y / --yes)
 USE_COLOR=true        # emit ANSI color                   (--no-color)
@@ -307,6 +308,7 @@ ${BOLD}OPTIONS${NC}
       --skip-system    Skip the macOS system-update stage
       --no-cleanup     Don't run 'brew cleanup'
       --no-trust       Don't auto-trust installed third-party-tap packages
+      --notify         Post a macOS notification when the run finishes
 
       --no-color       Disable colored output
       --no-log         Don't write a transcript to ~/Library/Logs
@@ -340,6 +342,7 @@ parse_args() {
       --skip-system)    DO_SYSTEM=false ;;
       --no-cleanup)     DO_CLEANUP=false ;;
       --no-trust)       DO_TRUST=false ;;
+      --notify)         DO_NOTIFY=true ;;
       --no-color)       USE_COLOR=false ;;
       --no-log)         USE_LOG=false ;;
       -h|--help)        setup_colors; print_help; exit 0 ;;
@@ -1015,6 +1018,33 @@ print_summary() {
   fi
 }
 
+# Post a macOS notification (with a sound) so a run you tabbed away from can
+# call you back — a full update easily takes ten minutes. Only with --notify.
+# osascript gets its text via argv rather than spliced into the AppleScript
+# source, so nothing in the message can break (or inject into) the script.
+notify_done() {
+  [[ "$DO_NOTIFY" == true ]] || return 0
+  if [[ "$DRY_RUN" == true ]]; then
+    note "Dry run: would post a completion notification."
+    return 0
+  fi
+
+  local msg
+  if [[ "$FAILURES" -gt 0 ]]; then
+    msg="Finished with ${FAILURES} problem(s) — check the terminal."
+  elif [[ "$SYSTEM_RESULT" == "staged" ]]; then
+    msg="Finished — macOS updates are staged; restart to complete them."
+  else
+    msg="All done — your Mac is up to date."
+  fi
+
+  osascript -e 'on run argv' \
+            -e 'display notification (item 2 of argv) with title (item 1 of argv) sound name "Glass"' \
+            -e 'end run' \
+            "$SELF_NAME" "$msg" >/dev/null 2>&1 \
+    || warn "Couldn't post the completion notification."
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  Banner
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1075,6 +1105,10 @@ main() {
   fi
 
   status_close
+  # Notify before the summary: print_summary can end waiting on the restart
+  # prompt, and the whole point of --notify is to call back a user who tabbed
+  # away — they should get pinged, not silently waited for.
+  notify_done
   print_summary
 
   [[ "$FAILURES" -gt 0 ]] && exit 1
