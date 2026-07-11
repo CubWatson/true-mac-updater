@@ -57,6 +57,10 @@ set -uo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 readonly VERSION="2.0.0"
 readonly SELF_NAME="TrueMacUpdater"
+# Below this much free disk, preflight warns and asks before continuing. Blunt
+# on purpose: a macOS update alone can want this much, and an update that dies
+# halfway through a download is the worst failure mode this script has.
+readonly MIN_FREE_DISK_GB=10
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Configuration — these are the defaults; parse_args() flips them from flags
@@ -378,14 +382,19 @@ setup_logging() {
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Verify we're on a supported machine and print the run header (OS, host, user,
-# log path). Hard-stops on non-macOS; only warns (and asks) on non-arm64, since
-# the tool can still mostly work on Intel even though it's tuned for Apple Silicon.
+# disk, log path). Hard-stops on non-macOS; only warns (and asks) on non-arm64,
+# since the tool can still mostly work on Intel even though it's tuned for Apple
+# Silicon, and on low disk, since the user may know their updates are small.
 preflight() {
   [[ "$(uname -s)" == "Darwin" ]] || die "This script only runs on macOS."
 
-  local arch macos
+  local arch macos free_gb
   arch=$(uname -m)
   macos=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
+  # Free space on the boot volume, in whole GB ($4 = "Available"). If df's
+  # output isn't understood, free_gb ends up non-numeric and the check below
+  # is skipped rather than blocking the run on a parsing quirk.
+  free_gb=$(df -g / 2>/dev/null | awk 'NR == 2 { print $4 }')
 
   if [[ "$arch" != "arm64" ]]; then
     warn "This Mac reports architecture '${arch}', not Apple Silicon (arm64)."
@@ -395,6 +404,16 @@ preflight() {
   info "Mac:    $(sw_vers -productName 2>/dev/null || echo macOS) ${macos} (${arch})"
   info "Host:   $(scutil --get ComputerName 2>/dev/null || hostname)"
   info "User:   ${USER}"
+  case "$free_gb" in
+    *[!0-9]*|'') ;;  # unparseable — skip the disk check
+    *)
+      info "Disk:   ${free_gb} GB free"
+      if [[ "$free_gb" -lt "$MIN_FREE_DISK_GB" ]]; then
+        warn "Low disk space (under ${MIN_FREE_DISK_GB} GB) — updates that fail mid-download can leave a real mess."
+        confirm "Continue anyway?" "N" || die "Aborted."
+      fi
+      ;;
+  esac
   [[ "$USE_LOG" == true && -n "$LOG_FILE" ]] && info "Log:    ${LOG_FILE}"
   [[ "$DRY_RUN" == true ]] && warn "DRY RUN — nothing will actually be changed."
 }
