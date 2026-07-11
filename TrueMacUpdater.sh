@@ -31,8 +31,8 @@
 #
 #   • Resilient, not fail-fast. A stage NEVER aborts the script. Instead each
 #     stage records its outcome in a <STAGE>_RESULT global ("ok"/"failed"/
-#     "skipped") and bumps FAILURES on trouble. main() exits non-zero at the end
-#     iff FAILURES > 0. This is why we deliberately do NOT use `set -e`.
+#     "skipped"/"staged") and bumps FAILURES on trouble. main() exits non-zero
+#     at the end iff FAILURES > 0. This is why we deliberately do NOT use `set -e`.
 #
 #   • Honest reporting. We only claim success when the thing actually happened.
 #     The summary reflects reality even when individual steps go sideways.
@@ -82,12 +82,14 @@ STDOUT_IS_TTY=false
 #  Summary state — each stage writes here; print_summary() reads it at the end.
 #  Plain scalars only (no associative arrays) to stay bash 3.2 compatible.
 # ─────────────────────────────────────────────────────────────────────────────
-BREW_RESULT="skipped"      # "ok" | "failed" | "skipped" — outcome of each stage
-APPSTORE_RESULT="skipped"
-SYSTEM_RESULT="skipped"
+BREW_RESULT="skipped"      # "ok" | "failed" | "skipped" — outcome of each stage;
+APPSTORE_RESULT="skipped"  # the macOS stage can also be "staged": downloaded,
+SYSTEM_RESULT="skipped"    # but only truly installed after a restart
 BREW_COUNT=0               # how many updates each stage found (for the summary)
 APPSTORE_COUNT=0
 SYSTEM_COUNT=0
+BREW_ITEMS=""              # per-item outcomes from the upgrade loops, one
+APPSTORE_ITEMS=""          # "<ok|failed>\t<name>" line each, for the summary
 RESTART_REQUIRED=false     # set true if a macOS update needs a reboot to finish
 FAILURES=0                 # number of stages that hit trouble; drives exit code
 START_TS=$(date +%s)       # wall-clock start, so the summary can show duration
@@ -252,6 +254,7 @@ status_finish() {
   case "$2" in
     ok)     text="✓ done · $3 update(s)" ;;
     failed) text="✗ problems (see above)" ;;
+    staged) text="» staged · finishes on restart" ;;
     *)      text="– $2" ;;
   esac
   status_set "$1" "$text"
@@ -593,11 +596,13 @@ brew_upgrade_each() {
     # global tee) so we can recognize — and recover from — a benign 'brew link'
     # conflict without re-running the upgrade.
     if HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade "$flag" "$name" 2>&1 | tee "$upgrade_log"; then
-      : # upgraded cleanly
+      BREW_ITEMS+="ok	${name}"$'\n'
     elif brew_recover_link_conflicts "$upgrade_log"; then
       ok "${name} upgraded (resolved a link conflict)."
+      BREW_ITEMS+="ok	${name}"$'\n'
     else
       warn "Upgrade of ${name} failed (see output above)."
+      BREW_ITEMS+="failed	${name}"$'\n'
       failed=$((failed + 1))
     fi
   done 3<<EOF
@@ -761,12 +766,15 @@ mas_update_each() {
     if [[ -n "$actual" && "$actual" == "$new" ]]; then
       [[ "$mas_ok" == false ]] && note "mas reported an error, but the bundle is at ${new} — counting it as updated."
       ok "${name} is now ${new}."
+      APPSTORE_ITEMS+="ok	${name}"$'\n'
     elif [[ -z "$actual" && "$mas_ok" == true ]]; then
       # Bundle unreadable (moved? renamed?) — fall back to mas's own verdict.
       note "Couldn't verify ${name} on disk; trusting mas's success report."
       ok "${name} updated."
+      APPSTORE_ITEMS+="ok	${name}"$'\n'
     else
       warn "${name} still reports version ${actual:-unknown} (expected ${new})."
+      APPSTORE_ITEMS+="failed	${name}"$'\n'
       failed=$((failed + 1))
     fi
   done 3<<EOF
@@ -906,8 +914,16 @@ stage_system() {
   fi
 
   if sudo softwareupdate "${sw_args[@]}"; then
-    ok "System updates installed."
-    SYSTEM_RESULT="ok"
+    if [[ "$RESTART_REQUIRED" == true && "$AUTO_RESTART" == false ]]; then
+      # Restart-class updates aren't truly installed until the reboot happens
+      # (on Apple Silicon, plain sudo can only download and stage them), so
+      # don't claim more than what actually took place.
+      warn "Updates are downloaded & staged — they finish installing on restart."
+      SYSTEM_RESULT="staged"
+    else
+      ok "System updates installed."
+      SYSTEM_RESULT="ok"
+    fi
   else
     warn "softwareupdate reported a problem (see output above)."
     SYSTEM_RESULT="failed"; FAILURES=$((FAILURES + 1))
@@ -920,7 +936,7 @@ stage_system() {
 
 # Print one line of the summary table, mapping a result string to an icon+color.
 #   $1  label   (e.g. "Homebrew")
-#   $2  result  ("ok" | "failed" | "skipped"; anything else renders as "?")
+#   $2  result  ("ok" | "failed" | "skipped" | "staged"; anything else renders as "?")
 #   $3  extra   trailing dimmed detail (e.g. "3 update(s)")
 row() {
   local label="$1" result="$2" extra="${3:-}" icon color
@@ -928,9 +944,25 @@ row() {
     ok)      icon="✓"; color="$GREEN" ;;
     failed)  icon="✗"; color="$RED" ;;
     skipped) icon="–"; color="$DIM" ;;
+    staged)  icon="»"; color="$YELLOW" ;;
     *)       icon="?"; color="$YELLOW" ;;
   esac
   printf '  %s%s%s  %-11s %s%s%s\n' "$color" "$icon" "$NC" "$label" "$DIM" "$extra" "$NC"
+}
+
+# Print the per-item detail lines under a stage's summary row: one dimmed line
+# per attempted upgrade, ✓ or ✗ by outcome. Takes the stage's *_ITEMS lines;
+# prints nothing when no upgrades were attempted (skipped, dry run, up to date).
+row_items() {
+  local state name icon color
+  [[ -z "$1" ]] && return 0
+  while IFS=$'\t' read -r state name; do
+    [[ -z "$name" ]] && continue
+    if [[ "$state" == "ok" ]]; then icon="✓"; color="$GREEN"; else icon="✗"; color="$RED"; fi
+    printf '       %s%s%s %s%s%s\n' "$color" "$icon" "$NC" "$DIM" "$name" "$NC"
+  done <<EOF
+$1
+EOF
 }
 
 # Print the final report: per-stage pass/fail table, elapsed time, transcript
@@ -952,7 +984,9 @@ print_summary() {
   if [[ "$DO_SYSTEM" == true ]]; then system_extra="${SYSTEM_COUNT} update(s)"; else SYSTEM_RESULT="skipped"; system_extra="disabled"; fi
 
   row "Homebrew"  "$BREW_RESULT"     "$brew_extra"
+  row_items "$BREW_ITEMS"
   row "App Store" "$APPSTORE_RESULT" "$appstore_extra"
+  row_items "$APPSTORE_ITEMS"
   row "macOS"     "$SYSTEM_RESULT"   "$system_extra"
   echo ""
   printf '  %sTook %dm %02ds%s\n' "$DIM" "$mins" "$secs" "$NC"
@@ -963,6 +997,8 @@ print_summary() {
     warn "${FAILURES} stage(s) had problems — scroll up for details."
   elif [[ "$DRY_RUN" == true ]]; then
     ok "Dry run complete. Re-run without --dry-run to apply."
+  elif [[ "$SYSTEM_RESULT" == "staged" ]]; then
+    ok "Almost there — macOS updates are staged and finish installing on restart."
   else
     printf '%s%s🎉 Your Mac is fully up to date.%s\n' "$BOLD" "$GREEN" "$NC"
   fi
