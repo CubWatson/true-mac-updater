@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](https://www.apple.com/macos/)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnu-bash&logoColor=white)](https://www.gnu.org/software/bash/)
-[![Version](https://img.shields.io/badge/version-2.0.0-blue)](TrueMacUpdater.sh)
+[![Version](https://img.shields.io/badge/version-2.1.0-blue)](TrueMacUpdater.sh)
 
 **One command to update your entire Mac** — Homebrew, the App Store, and macOS itself.
 
@@ -22,21 +22,22 @@ That's it. The script walks through three stages and gives you a clean summary a
 | Stage | Tool | Action |
 |-------|------|--------|
 | 1 · Homebrew | `brew` | Updates the catalog, upgrades formulae **and** casks, then cleans up old versions |
-| 2 · App Store | `mas` | Upgrades every app you own from the Mac App Store |
+| 2 · App Store | `mas` | Upgrades every app you own from the Mac App Store (asks for your password — mas 7 installs as root) |
 | 3 · macOS | `softwareupdate` | Installs system & security updates (asks for your password) |
 
 It's **resilient**: if one stage hits a problem, the others still run, and the summary tells you honestly what succeeded and what didn't.
 
 ## Highlights
 
-- **Safe by default** — shows you what's outdated and asks before changing anything.
+- **Safe by default** — shows you what's outdated (and whether you have the disk space for it) and asks before changing anything.
+- **Live progress** — packages and apps upgrade one at a time with an `[n/N]` counter, and a status area pinned to the bottom of the terminal keeps all three stages in view while their output scrolls above.
 - **`--dry-run`** — preview everything without touching your system.
 - **Self-healing** — installs `mas` (and offers to install Homebrew) if they're missing.
 - **No more skipped taps** — auto-trusts packages you already have installed from third-party Homebrew taps, so `brew upgrade` stops silently skipping them (Homebrew 6+). New, not-yet-installed packages still prompt you; opt out with `--no-trust`.
 - **Recovers from link conflicts** — when a formula's `brew link` step collides with files a cask already owns (classically the `docker` formula vs. the `docker-desktop` cask), it auto-runs Homebrew's own `brew link --overwrite` fix instead of failing the whole Homebrew stage. A genuine upgrade failure still reports as failed.
 - **Sudo kept alive** — type your password once; no mid-run interruptions.
 - **Done notification** — `--notify` posts a macOS notification when the run finishes, so you can tab away.
-- **Honest summary** — per-stage status, counts, elapsed time, and restart detection.
+- **Honest summary** — per-stage *and* per-item pass/fail, counts, elapsed time, and a distinct "staged" state for macOS updates that only finish installing on restart. App Store updates are verified against the app bundle's version on disk, not just `mas`'s exit code.
 - **Full transcript** saved to `~/Library/Logs/TrueMacUpdater/`.
 - **Color-aware** — respects `NO_COLOR` and non-interactive pipes.
 

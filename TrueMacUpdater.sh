@@ -55,7 +55,7 @@ set -uo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 #  Metadata
 # ─────────────────────────────────────────────────────────────────────────────
-readonly VERSION="2.0.0"
+readonly VERSION="2.1.0"
 readonly SELF_NAME="TrueMacUpdater"
 # Below this much free disk, preflight warns and asks before continuing. Blunt
 # on purpose: a macOS update alone can want this much, and an update that dies
