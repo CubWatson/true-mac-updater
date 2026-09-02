@@ -3,9 +3,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](https://www.apple.com/macos/)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnu-bash&logoColor=white)](https://www.gnu.org/software/bash/)
-[![Version](https://img.shields.io/badge/version-2.1.0-blue)](TrueMacUpdater.sh)
+[![Version](https://img.shields.io/badge/version-2.2.0-blue)](TrueMacUpdater.sh)
 
-**One command to update your entire Mac** — Homebrew, the App Store, and macOS itself.
+**One command to update your Mac's software** — Homebrew and App Store apps, plus a check for macOS updates.
 
 Built for Apple Silicon (M-series, `arm64`).
 
@@ -21,24 +21,24 @@ That's it. The script walks through three stages and gives you a clean summary a
 
 | Stage | Tool | Action |
 |-------|------|--------|
-| 1 · Homebrew | `brew` | Updates the catalog, upgrades formulae **and** casks, then cleans up old versions |
-| 2 · App Store | `mas` | Upgrades every app you own from the Mac App Store (asks for your password — mas 7 installs as root) |
-| 3 · macOS | `softwareupdate` | Installs system & security updates (asks for your password) |
+| 1 · Homebrew | `brew` | Updates the catalog, then upgrades installed formulae **and** casks |
+| 2 · App Store | `mas` | Updates installed Mac App Store apps (asks for your password — mas 7 installs as root) |
+| 3 · macOS | `softwareupdate` | Checks for system and security updates, then directs you to System Settings to install them |
 
 It's **resilient**: if one stage hits a problem, the others still run, and the summary tells you honestly what succeeded and what didn't.
 
 ## Highlights
 
-- **Safe by default** — shows you what's outdated (and whether you have the disk space for it) and asks before changing anything.
+- **Safe by default** — shows you what's outdated (and whether you have the disk space for it) and asks before changing packages or apps.
 - **Live progress** — packages and apps upgrade one at a time with an `[n/N]` counter, and a status area pinned to the bottom of the terminal keeps all three stages in view while their output scrolls above.
 - **`--dry-run`** — preview everything without touching your system.
 - **Self-healing** — installs `mas` (and offers to install Homebrew) if they're missing.
 - **No more skipped taps** — auto-trusts packages you already have installed from third-party Homebrew taps, so `brew upgrade` stops silently skipping them (Homebrew 6+). New, not-yet-installed packages still prompt you; opt out with `--no-trust`.
 - **Recovers from link conflicts** — when a formula's `brew link` step collides with files a cask already owns (classically the `docker` formula vs. the `docker-desktop` cask), it auto-runs Homebrew's own `brew link --overwrite` fix instead of failing the whole Homebrew stage. A genuine upgrade failure still reports as failed.
-- **Sudo kept alive** — type your password once; no mid-run interruptions.
+- **Sudo kept alive** — type your password once for App Store updates; no mid-run interruptions.
 - **Done notification** — `--notify` posts a macOS notification when the run finishes, so you can tab away.
-- **Honest summary** — per-stage *and* per-item pass/fail, counts, elapsed time, and a distinct "staged" state for macOS updates that only finish installing on restart. App Store updates are verified against the app bundle's version on disk, not just `mas`'s exit code.
-- **Full transcript** saved to `~/Library/Logs/TrueMacUpdater/`.
+- **Honest summary** — per-stage *and* per-item results, counts, elapsed time, and a clear notice when macOS updates are waiting in System Settings. App Store updates are verified against the app bundle's version on disk, not just `mas`'s exit code.
+- **Manageable logs** — transcripts are saved to `~/Library/Logs/TrueMacUpdater/`; delete them all with `--clear-logs`.
 - **Color-aware** — respects `NO_COLOR` and non-interactive pipes.
 
 ## Usage
@@ -46,8 +46,9 @@ It's **resilient**: if one stage hits a problem, the others still run, and the s
 ```bash
 ./TrueMacUpdater.sh                 # interactive, does everything
 ./TrueMacUpdater.sh --dry-run       # preview only, change nothing
-./TrueMacUpdater.sh -y -r           # fully unattended, reboot if macOS needs it
-./TrueMacUpdater.sh --skip-system   # just Homebrew + App Store (no sudo needed)
+./TrueMacUpdater.sh -y              # update without confirmation prompts
+./TrueMacUpdater.sh --skip-system   # skip the macOS update check
+./TrueMacUpdater.sh --clear-logs    # delete every saved transcript and exit
 ```
 
 ### Options
@@ -56,15 +57,14 @@ It's **resilient**: if one stage hits a problem, the others still run, and the s
 |------|-------------|
 | `-y, --yes` | Don't ask for confirmation; assume yes |
 | `-n, --dry-run` | Show what would happen, change nothing |
-| `-r, --restart` | Reboot automatically if macOS updates require it |
 | `--skip-brew` | Skip the Homebrew stage |
 | `--skip-appstore` | Skip the App Store stage |
 | `--skip-system` | Skip the macOS system-update stage |
-| `--no-cleanup` | Don't run `brew cleanup` |
 | `--no-trust` | Don't auto-trust installed packages from third-party taps |
 | `--notify` | Post a macOS notification when the run finishes |
 | `--no-color` | Disable colored output |
 | `--no-log` | Don't write a transcript |
+| `--clear-logs` | Delete all saved transcripts and exit |
 | `-h, --help` | Show help |
 | `-v, --version` | Show version |
 

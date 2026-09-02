@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
 # ╭───────────────────────────────────────────────────────────────────────╮
-# │  TrueMacUpdater — the one command that updates your whole Mac         │
+# │  TrueMacUpdater — update apps and check macOS in one command          │
 # │                                                                       │
-# │  • Homebrew     formulae, casks, and cleanup                          │
-# │  • App Store    every app you bought, via mas                         │
-# │  • macOS        system + security software updates                    │
+# │  • Homebrew     installed formulae and casks                          │
+# │  • App Store    installed apps, via mas                               │
+# │  • macOS        checks for system + security software updates         │
 # │                                                                       │
 # │  Built for Apple Silicon (M-series, arm64).                           │
 # ╰───────────────────────────────────────────────────────────────────────╯
@@ -22,16 +22,16 @@
 #    ├─ setup_colors()      decide whether to emit ANSI color
 #    ├─ setup_logging()     tee the whole run to ~/Library/Logs (unless --no-log)
 #    ├─ preflight()         sanity-check the machine, print the header
-#    ├─ stage_homebrew()    Stage 1 — brew update / upgrade / cleanup
+#    ├─ stage_homebrew()    Stage 1 — brew update / upgrade
 #    ├─ stage_appstore()    Stage 2 — Mac App Store apps, via `mas`
-#    ├─ stage_system()      Stage 3 — macOS system & security updates
+#    ├─ stage_system()      Stage 3 — check for macOS system updates
 #    └─ print_summary()     the final pass/fail table + exit code
 #
 #  Design principles, so changes stay consistent:
 #
 #   • Resilient, not fail-fast. A stage NEVER aborts the script. Instead each
 #     stage records its outcome in a <STAGE>_RESULT global ("ok"/"failed"/
-#     "skipped"/"staged") and bumps FAILURES on trouble. main() exits non-zero
+#     "skipped"/"available") and bumps FAILURES on trouble. main() exits non-zero
 #     at the end iff FAILURES > 0. This is why we deliberately do NOT use `set -e`.
 #
 #   • Honest reporting. We only claim success when the thing actually happened.
@@ -55,11 +55,11 @@ set -uo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 #  Metadata
 # ─────────────────────────────────────────────────────────────────────────────
-readonly VERSION="2.1.0"
+readonly VERSION="2.2.0"
 readonly SELF_NAME="TrueMacUpdater"
 # Below this much free disk, preflight warns and asks before continuing. Blunt
-# on purpose: a macOS update alone can want this much, and an update that dies
-# halfway through a download is the worst failure mode this script has.
+# on purpose: package and App Store updates can still be large, and an update
+# that dies halfway through a download can leave a real mess.
 readonly MIN_FREE_DISK_GB=10
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,14 +68,13 @@ readonly MIN_FREE_DISK_GB=10
 DO_BREW=true          # run the Homebrew stage          (--skip-brew)
 DO_APPSTORE=true      # run the App Store stage          (--skip-appstore)
 DO_SYSTEM=true        # run the macOS system-update stage (--skip-system)
-DO_CLEANUP=true       # run `brew cleanup` after upgrades (--no-cleanup)
 DO_TRUST=true         # auto-trust third-party-tap packages (--no-trust)
 DO_NOTIFY=false       # post a notification when the run ends (--notify)
 DRY_RUN=false         # preview only, mutate nothing      (-n / --dry-run)
 ASSUME_YES=false      # answer "yes" to every prompt      (-y / --yes)
 USE_COLOR=true        # emit ANSI color                   (--no-color)
 USE_LOG=true          # write a transcript to ~/Library/Logs (--no-log)
-AUTO_RESTART=false    # reboot automatically if macOS asks (-r / --restart)
+CLEAR_LOGS=false      # delete all saved transcripts and exit (--clear-logs)
 
 # Whether stdout is a real terminal. We capture this *before* setup_logging()
 # may redirect stdout into a `tee` pipe — past that point `[[ -t 1 ]]` would
@@ -88,14 +87,13 @@ STDOUT_IS_TTY=false
 #  Plain scalars only (no associative arrays) to stay bash 3.2 compatible.
 # ─────────────────────────────────────────────────────────────────────────────
 BREW_RESULT="skipped"      # "ok" | "failed" | "skipped" — outcome of each stage;
-APPSTORE_RESULT="skipped"  # the macOS stage can also be "staged": downloaded,
-SYSTEM_RESULT="skipped"    # but only truly installed after a restart
+APPSTORE_RESULT="skipped"  # the macOS stage can also be "available" when the
+SYSTEM_RESULT="skipped"     # user needs to install an update in System Settings
 BREW_COUNT=0               # how many updates each stage found (for the summary)
 APPSTORE_COUNT=0
 SYSTEM_COUNT=0
 BREW_ITEMS=""              # per-item outcomes from the upgrade loops, one
 APPSTORE_ITEMS=""          # "<ok|failed>\t<name>" line each, for the summary
-RESTART_REQUIRED=false     # set true if a macOS update needs a reboot to finish
 FAILURES=0                 # number of stages that hit trouble; drives exit code
 START_TS=$(date +%s)       # wall-clock start, so the summary can show duration
 LOG_FILE=""                # path to the transcript, filled in by setup_logging()
@@ -259,8 +257,8 @@ status_finish() {
   case "$2" in
     ok)     text="✓ done · $3 update(s)" ;;
     failed) text="✗ problems (see above)" ;;
-    staged) text="» staged · finishes on restart" ;;
-    *)      text="– $2" ;;
+    available) text="! available · install manually" ;;
+    *)         text="– $2" ;;
   esac
   status_set "$1" "$text"
 }
@@ -292,37 +290,37 @@ status_close() {
 # the case statement in parse_args() so they stay in sync.
 print_help() {
   cat <<EOF
-${BOLD}${SELF_NAME}${NC} v${VERSION} — update your entire Mac with one command.
+${BOLD}${SELF_NAME}${NC} v${VERSION} — update apps and check macOS with one command.
 
 ${BOLD}USAGE${NC}
   ./TrueMacUpdater.sh [options]
 
 ${BOLD}WHAT IT DOES${NC}
-  1. Homebrew   updates, upgrades formulae & casks, then cleans up
-  2. App Store  upgrades every app you own (via mas)
-  3. macOS      installs system & security updates (needs sudo)
+  1. Homebrew   updates installed formulae & casks
+  2. App Store  updates installed apps (via mas)
+  3. macOS      checks for updates; you install them in System Settings
 
 ${BOLD}OPTIONS${NC}
   -y, --yes            Don't ask for confirmation; assume yes
   -n, --dry-run        Show what would happen, change nothing
-  -r, --restart        Reboot automatically if macOS updates require it
 
       --skip-brew      Skip the Homebrew stage
       --skip-appstore  Skip the App Store stage
       --skip-system    Skip the macOS system-update stage
-      --no-cleanup     Don't run 'brew cleanup'
       --no-trust       Don't auto-trust installed third-party-tap packages
       --notify         Post a macOS notification when the run finishes
 
       --no-color       Disable colored output
       --no-log         Don't write a transcript to ~/Library/Logs
+      --clear-logs     Delete all saved transcripts and exit
   -h, --help           Show this help and exit
   -v, --version        Show version and exit
 
 ${BOLD}EXAMPLES${NC}
   ./TrueMacUpdater.sh                 # interactive, does everything
-  ./TrueMacUpdater.sh -y -r           # fully unattended, reboot if needed
-  ./TrueMacUpdater.sh --skip-system   # just brew + App Store, no sudo
+  ./TrueMacUpdater.sh -y              # update without confirmation prompts
+  ./TrueMacUpdater.sh --skip-system   # skip the macOS update check
+  ./TrueMacUpdater.sh --clear-logs    # delete saved transcripts
   ./TrueMacUpdater.sh --dry-run       # preview only
 EOF
 }
@@ -340,15 +338,14 @@ parse_args() {
     case "$1" in
       -y|--yes)         ASSUME_YES=true ;;
       -n|--dry-run)     DRY_RUN=true ;;
-      -r|--restart)     AUTO_RESTART=true ;;
       --skip-brew)      DO_BREW=false ;;
       --skip-appstore)  DO_APPSTORE=false ;;
       --skip-system)    DO_SYSTEM=false ;;
-      --no-cleanup)     DO_CLEANUP=false ;;
       --no-trust)       DO_TRUST=false ;;
       --notify)         DO_NOTIFY=true ;;
       --no-color)       USE_COLOR=false ;;
       --no-log)         USE_LOG=false ;;
+      --clear-logs)     CLEAR_LOGS=true ;;
       -h|--help)        setup_colors; print_help; exit 0 ;;
       -v|--version)     echo "${SELF_NAME} v${VERSION}"; exit 0 ;;
       *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
@@ -360,6 +357,27 @@ parse_args() {
 # ═════════════════════════════════════════════════════════════════════════════
 #  Logging — tee a full transcript while keeping the screen readable
 # ═════════════════════════════════════════════════════════════════════════════
+
+# Remove the dedicated log directory and exit before starting a normal run. The
+# path is fixed rather than user-supplied, keeping this intentionally destructive
+# command narrow. A later run recreates the directory when logging starts.
+clear_logs() {
+  local dir="${HOME}/Library/Logs/${SELF_NAME}"
+  if [[ "$DRY_RUN" == true ]]; then
+    note "Dry run: would delete all logs from ${dir}."
+    return 0
+  fi
+  if [[ ! -e "$dir" && ! -L "$dir" ]]; then
+    note "No TrueMacUpdater logs to delete."
+    return 0
+  fi
+  if rm -rf "$dir"; then
+    ok "Deleted all logs from ${dir}."
+  else
+    err "Couldn't delete logs from ${dir}."
+    return 1
+  fi
+}
 
 # Start mirroring all output to a timestamped transcript under ~/Library/Logs.
 # Skipped for --no-log and --dry-run (a preview isn't worth a log file). If the
@@ -419,11 +437,10 @@ preflight() {
 }
 
 # Acquire admin rights once and keep them warm for the rest of the run, so a long
-# install doesn't suddenly block on a password prompt halfway through. Both the
-# App Store stage (mas 7 runs updates as root) and the macOS stage need this;
-# calling it again is a cheap no-op once the keepalive is running. PID of the
-# background refresher is stored so cleanup_on_exit() can stop it. Returns 1 if
-# the user fails/declines the initial sudo prompt.
+# install doesn't suddenly block on a password prompt halfway through. The App
+# Store stage needs this because mas 7 runs updates as root. PID of the background
+# refresher is stored so cleanup_on_exit() can stop it. Returns 1 if the user
+# fails/declines the initial sudo prompt.
 #   $1  the reason to show the user before the password prompt
 SUDO_KEEPALIVE_PID=""
 ensure_sudo() {
@@ -490,8 +507,11 @@ install_homebrew() {
 # every receipt has precisely one "tap" key, so a plain sed pulls it out with no
 # dependency on jq (which isn't present on macOS before 15).
 trust_installed_packages() {
-  local prefix
-  prefix=$(brew --prefix 2>/dev/null) || return 0
+  local prefix failed=false
+  if ! prefix=$(brew --prefix 2>/dev/null); then
+    warn "Couldn't locate Homebrew's package directory."
+    return 1
+  fi
 
   # Build a newline list of "<flag>\t<full-name>" for installed packages whose
   # tap isn't an official homebrew/* one. Formulae and casks store receipts in
@@ -527,10 +547,13 @@ trust_installed_packages() {
       note "trusted ${fullname}"
     else
       warn "Couldn't trust ${fullname} (continuing)."
+      failed=true
     fi
   done <<EOF
 $entries
 EOF
+
+  [[ "$failed" == false ]]
 }
 
 # After a failed 'brew upgrade', some "failures" are not failures at all: a
@@ -642,14 +665,10 @@ EOF
   fi
 }
 
-# Stage 1 — Homebrew. Flow:
-#   1. ensure brew exists (offer to install it if not)
-#   2. `brew update`            refresh the catalog
-#   3. trust third-party taps   so step 4 doesn't skip them (unless --no-trust)
-#   4. `brew outdated`          list what needs upgrading (text + JSON forms)
-#   5. `brew upgrade <pkg>`     one package at a time, with an [n/N] counter
-#   6. `brew cleanup`           prune old versions (unless --no-cleanup)
-# Records the outcome in BREW_RESULT / BREW_COUNT for the summary.
+# Stage 1 — Homebrew. Refresh the catalog, make already-installed third-party
+# packages visible to Homebrew 6, discover outdated formulae/casks from one JSON
+# response, then upgrade each package independently. Records BREW_RESULT /
+# BREW_COUNT for the summary.
 stage_homebrew() {
   section "1 · Homebrew"
 
@@ -667,52 +686,71 @@ stage_homebrew() {
     fi
   fi
 
+  if [[ "$DRY_RUN" == false ]] && ! confirm "Check for and install Homebrew updates?" "Y"; then
+    note "Skipped by choice."
+    BREW_RESULT="skipped"; return
+  fi
+
+  local outdated_json entries flag name expected_count version_count
+
   step "Refreshing Homebrew's catalog…"
   if [[ "$DRY_RUN" == true ]]; then
     note "Dry run: would run 'brew update'."
   elif ! brew update; then
-    warn "'brew update' had trouble; continuing with what we have."
+    warn "'brew update' failed; can't reliably check for package updates."
+    BREW_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
   fi
 
-  # Trust already-installed third-party-tap packages before anything tries to
-  # load them, so 'brew outdated'/'brew upgrade' don't silently skip them.
-  [[ "$DO_TRUST" == true ]] && trust_installed_packages
+  # Homebrew otherwise omits installed packages from untrusted third-party taps.
+  if [[ "$DO_TRUST" == true ]] && ! trust_installed_packages; then
+    warn "Couldn't prepare all installed third-party packages for updates."
+    BREW_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
+  fi
 
-  # Grab the outdated list in both forms: the plain text for the human-readable
-  # listing (it shows versions), and --json=v2 to drive the upgrade loop.
-  local outdated entries
-  outdated=$(brew outdated 2>/dev/null || true)
-  entries=$(brew_outdated_entries "$(brew outdated --json=v2 2>/dev/null || true)")
-  # `grep -c .` counts non-empty lines = number of outdated packages. The `|| true`
-  # keeps a zero count (grep exits 1 when nothing matches) from tripping pipefail.
+  if ! outdated_json=$(HOMEBREW_NO_AUTO_UPDATE=1 brew outdated --json=v2 2>&1); then
+    warn "Couldn't check for outdated Homebrew packages."
+    [[ -n "$outdated_json" ]] && note "$outdated_json"
+    BREW_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
+  fi
+  case "$outdated_json" in
+    *'"formulae"'*'"casks"'*) ;;
+    *)
+      warn "Homebrew returned an unexpected outdated-package response."
+      [[ -n "$outdated_json" ]] && note "$outdated_json"
+      BREW_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
+      ;;
+  esac
+
+  entries=$(brew_outdated_entries "$outdated_json")
   BREW_COUNT=$(printf '%s' "$entries" | grep -c . || true)
+  expected_count=$(printf '%s' "$outdated_json" | grep -o '"installed_versions"' | grep -c . || true)
+  version_count=$(printf '%s' "$outdated_json" | grep -o '"current_version"' | grep -c . || true)
   BREW_COUNT=${BREW_COUNT:-0}
+  expected_count=${expected_count:-0}
+  version_count=${version_count:-0}
+  if [[ "$expected_count" -ne "$version_count" ]] ||
+     [[ "$BREW_COUNT" -ne "$expected_count" ]]; then
+    warn "Homebrew returned an incomplete outdated-package response."
+    BREW_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
+  fi
 
   if [[ "$BREW_COUNT" -eq 0 ]]; then
     ok "All Homebrew packages are already up to date."
     BREW_RESULT="ok"
   else
     info "${BREW_COUNT} package(s) can be upgraded:"
-    printf '%s\n' "$outdated" | sed 's/^/    /'
-    echo ""
+    while IFS=$'\t' read -r flag name; do
+      [[ -n "$name" ]] && note "$name"
+    done <<EOF
+$entries
+EOF
     if [[ "$DRY_RUN" == true ]]; then
       note "Dry run: would upgrade these one at a time with 'brew upgrade <package>'."
-      BREW_RESULT="ok"
-    elif confirm "Upgrade these now?" "Y"; then
+      BREW_RESULT="skipped"
+    else
       step "Upgrading formulae & casks (casks may ask for your password)…"
       brew_upgrade_each "$entries"
-    else
-      note "Skipped by choice."
-      BREW_RESULT="ok"
     fi
-  fi
-
-  # Reclaim disk space by removing outdated downloads and old keg versions.
-  # `--prune=all` drops every cached download regardless of age. Output is hidden
-  # (it's noisy and purely informational) unless something goes wrong.
-  if [[ "$DO_CLEANUP" == true && "$DRY_RUN" == false ]]; then
-    step "Cleaning up old versions & caches…"
-    if brew cleanup --prune=all >/dev/null 2>&1; then ok "Cleanup done."; else warn "Cleanup had issues."; fi
   fi
 }
 
@@ -741,6 +779,7 @@ mas_outdated_entries() {
     name=$(json_str_field "$line" "name")
     installed=$(json_str_field "$line" "version")
     new=$(json_str_field "$line" "newVersion")
+    [[ -z "$new" ]] && continue
     path=$(json_str_field "$line" "path")
     printf '%s\t%s\t%s\t%s\t%s\n' "$id" "${name:-app-$id}" "$installed" "$new" "$path"
   done
@@ -839,23 +878,39 @@ stage_appstore() {
   fi
 
   step "Checking for App Store updates…"
-  local entries
-  entries=$(mas outdated --json 2>/dev/null | mas_outdated_entries)
+  local outdated_json entries id name installed new path
+  if ! outdated_json=$(mas outdated --json 2>&1); then
+    warn "Couldn't check for App Store updates."
+    [[ -n "$outdated_json" ]] && note "$outdated_json"
+    APPSTORE_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
+  fi
+  entries=$(printf '%s\n' "$outdated_json" | mas_outdated_entries)
+  local response_count
+  response_count=$(printf '%s' "$outdated_json" | grep -c . || true)
   APPSTORE_COUNT=$(printf '%s' "$entries" | grep -c . || true)
+  response_count=${response_count:-0}
   APPSTORE_COUNT=${APPSTORE_COUNT:-0}
+  if [[ "$response_count" -ne "$APPSTORE_COUNT" ]]; then
+    warn "mas returned an incomplete outdated-app response."
+    [[ -n "$outdated_json" ]] && note "$outdated_json"
+    APPSTORE_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
+  fi
 
   if [[ "$APPSTORE_COUNT" -eq 0 ]]; then
-    ok "All App Store apps are up to date."
+    ok "All installed App Store apps are up to date."
     APPSTORE_RESULT="ok"; return
   fi
 
-  info "${APPSTORE_COUNT} App Store app(s) can be updated:"
-  printf '%s\n' "$entries" | awk -F'\t' '{ printf "    %s  %s → %s\n", $2, $3, $4 }'
-  echo ""
+  info "${APPSTORE_COUNT} installed App Store app(s) can be updated:"
+  while IFS=$'\t' read -r id name installed new path; do
+    [[ -n "$name" ]] && note "${name}  ${installed} → ${new}"
+  done <<EOF
+$entries
+EOF
 
   if [[ "$DRY_RUN" == true ]]; then
     note "Dry run: would update these one at a time with 'sudo mas update <app-id>'."
-    APPSTORE_RESULT="ok"; return
+    APPSTORE_RESULT="skipped"; return
   fi
 
   if confirm "Update these App Store apps now?" "Y"; then
@@ -866,7 +921,7 @@ stage_appstore() {
     mas_update_each "$entries"
   else
     note "Skipped by choice."
-    APPSTORE_RESULT="ok"
+    APPSTORE_RESULT="skipped"
   fi
 }
 
@@ -874,82 +929,53 @@ stage_appstore() {
 #  Stage 3 — macOS system updates
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Stage 3 — macOS system & security updates, via Apple's `softwareupdate` tool.
-# This is the only stage that can trigger a reboot, so it's deliberately handled
-# last (it shares sudo with stage 2). We parse `softwareupdate --list`
-# both to count updates and to detect whether any of them require a restart.
-# Records the outcome in SYSTEM_RESULT / SYSTEM_COUNT (and may set RESTART_REQUIRED).
+# Stage 3 — check for macOS system & security updates with Apple's
+# `softwareupdate` tool. Installation stays in System Settings: command-line
+# installation on Apple Silicon cannot reliably provide volume-owner approval.
+# Records "ok", "available", or "failed" in SYSTEM_RESULT.
 stage_system() {
   section "3 · macOS System Updates"
 
-  step "Scanning for system & security updates…"
+  step "Checking for system & security updates…"
   # `softwareupdate --list` prints to stderr on some macOS versions, so fold
-  # stderr in (2>&1) to capture the listing reliably; `|| true` ignores its exit.
-  local list
-  list=$(softwareupdate --list 2>&1 || true)
+  # stderr in (2>&1) to capture the listing reliably while preserving its status.
+  local list list_status details line
+  list=$(softwareupdate --list 2>&1)
+  list_status=$?
+
+  if [[ "$list_status" -ne 0 ]]; then
+    warn "Couldn't check for macOS updates."
+    [[ -n "$list" ]] && note "$list"
+    SYSTEM_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
+  fi
 
   if printf '%s' "$list" | grep -qi "No new software available"; then
     ok "macOS is fully up to date."
     SYSTEM_RESULT="ok"; return
   fi
 
-  # Each available update appears on a "* Label:" line in modern macOS.
+  # Each available update appears on a "* Label:" line in modern macOS. Keep a
+  # zero count if an older release uses a different format, but still show its
+  # listing and send the user to System Settings.
   SYSTEM_COUNT=$(printf '%s' "$list" | grep -c '\* Label:' || true)
   SYSTEM_COUNT=${SYSTEM_COUNT:-0}
+  details=$(printf '%s\n' "$list" | grep -E 'Title:|\* Label:' || true)
+  [[ -n "$details" ]] || details="$list"
 
-  # Note whether any update wants a restart.
-  if printf '%s' "$list" | grep -qiE 'restart|shut down'; then
-    RESTART_REQUIRED=true
-  fi
-
-  if [[ "$SYSTEM_COUNT" -gt 0 ]]; then
-    info "${SYSTEM_COUNT} system update(s) available:"
-    printf '%s\n' "$list" | grep -E 'Title:|\* Label:' | sed 's/^/  /'
+  if [[ "$SYSTEM_COUNT" -eq 1 ]]; then
+    warn "A macOS update is available:"
+  elif [[ "$SYSTEM_COUNT" -gt 1 ]]; then
+    warn "${SYSTEM_COUNT} macOS updates are available:"
   else
-    info "Updates are available:"
-    printf '%s\n' "$list" | sed 's/^/  /'
+    warn "macOS reports that updates are available:"
   fi
-  echo ""
-  [[ "$RESTART_REQUIRED" == true ]] && warn "At least one update will require a restart."
-
-  if [[ "$DRY_RUN" == true ]]; then
-    note "Dry run: would run 'sudo softwareupdate --install --all'."
-    SYSTEM_RESULT="ok"; return
-  fi
-
-  if ! confirm "Install macOS system updates now?" "Y"; then
-    note "Skipped by choice."
-    SYSTEM_RESULT="ok"; return
-  fi
-
-  if ! ensure_sudo "macOS updates need administrator access."; then
-    err "Administrator access denied — skipping system updates."
-    SYSTEM_RESULT="failed"; FAILURES=$((FAILURES + 1)); return
-  fi
-
-  step "Installing system updates (this can take a while)…"
-  status_set system "installing ${SYSTEM_COUNT} update(s)…"
-  local sw_args=(--install --all)
-  if [[ "$RESTART_REQUIRED" == true && "$AUTO_RESTART" == true ]]; then
-    warn "Updates will install and the Mac will RESTART automatically."
-    sw_args+=(--restart)
-  fi
-
-  if sudo softwareupdate "${sw_args[@]}"; then
-    if [[ "$RESTART_REQUIRED" == true && "$AUTO_RESTART" == false ]]; then
-      # Restart-class updates aren't truly installed until the reboot happens
-      # (on Apple Silicon, plain sudo can only download and stage them), so
-      # don't claim more than what actually took place.
-      warn "Updates are downloaded & staged — they finish installing on restart."
-      SYSTEM_RESULT="staged"
-    else
-      ok "System updates installed."
-      SYSTEM_RESULT="ok"
-    fi
-  else
-    warn "softwareupdate reported a problem (see output above)."
-    SYSTEM_RESULT="failed"; FAILURES=$((FAILURES + 1))
-  fi
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && note "$line"
+  done <<EOF
+$details
+EOF
+  note "Open System Settings → General → Software Update to review and install manually."
+  SYSTEM_RESULT="available"
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -958,7 +984,7 @@ stage_system() {
 
 # Print one line of the summary table, mapping a result string to an icon+color.
 #   $1  label   (e.g. "Homebrew")
-#   $2  result  ("ok" | "failed" | "skipped" | "staged"; anything else renders as "?")
+#   $2  result  ("ok" | "failed" | "skipped" | "available"; otherwise "?")
 #   $3  extra   trailing dimmed detail (e.g. "3 update(s)")
 row() {
   local label="$1" result="$2" extra="${3:-}" icon color
@@ -966,7 +992,7 @@ row() {
     ok)      icon="✓"; color="$GREEN" ;;
     failed)  icon="✗"; color="$RED" ;;
     skipped) icon="–"; color="$DIM" ;;
-    staged)  icon="»"; color="$YELLOW" ;;
+    available) icon="!"; color="$YELLOW" ;;
     *)       icon="?"; color="$YELLOW" ;;
   esac
   printf '  %s%s%s  %-11s %s%s%s\n' "$color" "$icon" "$NC" "$label" "$DIM" "$extra" "$NC"
@@ -987,9 +1013,9 @@ $1
 EOF
 }
 
-# Print the final report: per-stage pass/fail table, elapsed time, transcript
-# path, an overall verdict, and (if needed) the reboot prompt. Reads all the
-# *_RESULT / *_COUNT / FAILURES / RESTART_REQUIRED globals the stages filled in.
+# Print the final report: per-stage results, elapsed time, transcript path, and
+# an overall verdict. Reads the *_RESULT / *_COUNT / FAILURES globals the stages
+# filled in.
 print_summary() {
   local end_ts elapsed mins secs
   end_ts=$(date +%s)
@@ -1003,7 +1029,15 @@ print_summary() {
   local brew_extra appstore_extra system_extra
   if [[ "$DO_BREW" == true ]]; then brew_extra="${BREW_COUNT} update(s)"; else BREW_RESULT="skipped"; brew_extra="disabled"; fi
   if [[ "$DO_APPSTORE" == true ]]; then appstore_extra="${APPSTORE_COUNT} update(s)"; else APPSTORE_RESULT="skipped"; appstore_extra="disabled"; fi
-  if [[ "$DO_SYSTEM" == true ]]; then system_extra="${SYSTEM_COUNT} update(s)"; else SYSTEM_RESULT="skipped"; system_extra="disabled"; fi
+  if [[ "$DO_SYSTEM" == true ]]; then
+    if [[ "$SYSTEM_RESULT" == "available" && "$SYSTEM_COUNT" -eq 0 ]]; then
+      system_extra="available"
+    else
+      system_extra="${SYSTEM_COUNT} update(s)"
+    fi
+  else
+    SYSTEM_RESULT="skipped"; system_extra="disabled"
+  fi
 
   row "Homebrew"  "$BREW_RESULT"     "$brew_extra"
   row_items "$BREW_ITEMS"
@@ -1018,22 +1052,15 @@ print_summary() {
   if [[ "$FAILURES" -gt 0 ]]; then
     warn "${FAILURES} stage(s) had problems — scroll up for details."
   elif [[ "$DRY_RUN" == true ]]; then
-    ok "Dry run complete. Re-run without --dry-run to apply."
-  elif [[ "$SYSTEM_RESULT" == "staged" ]]; then
-    ok "Almost there — macOS updates are staged and finish installing on restart."
+    ok "Dry run complete. No changes were made."
+  elif [[ "$SYSTEM_RESULT" == "available" ]]; then
+    warn "macOS updates are available — install them in System Settings."
+  elif [[ "$BREW_RESULT" == "skipped" ||
+          "$APPSTORE_RESULT" == "skipped" ||
+          "$SYSTEM_RESULT" == "skipped" ]]; then
+    warn "Run complete, but one or more stages were skipped."
   else
     printf '%s%s🎉 Your Mac is fully up to date.%s\n' "$BOLD" "$GREEN" "$NC"
-  fi
-
-  if [[ "$RESTART_REQUIRED" == true && "$AUTO_RESTART" == false && "$DRY_RUN" == false ]]; then
-    echo ""
-    warn "A restart is required to finish installing macOS updates."
-    if confirm "Restart now?" "N"; then
-      info "Restarting…"
-      sudo shutdown -r now
-    else
-      note "Remember to restart when you're ready."
-    fi
   fi
 }
 
@@ -1051,8 +1078,12 @@ notify_done() {
   local msg
   if [[ "$FAILURES" -gt 0 ]]; then
     msg="Finished with ${FAILURES} problem(s) — check the terminal."
-  elif [[ "$SYSTEM_RESULT" == "staged" ]]; then
-    msg="Finished — macOS updates are staged; restart to complete them."
+  elif [[ "$SYSTEM_RESULT" == "available" ]]; then
+    msg="Finished — macOS updates are available in System Settings."
+  elif [[ "$BREW_RESULT" == "skipped" ||
+          "$APPSTORE_RESULT" == "skipped" ||
+          "$SYSTEM_RESULT" == "skipped" ]]; then
+    msg="Finished — one or more stages were skipped; check the terminal."
   else
     msg="All done — your Mac is up to date."
   fi
@@ -1080,20 +1111,24 @@ banner() {
                                               |_|
 EOF
   printf '%s' "$NC"
-  printf '%s     one command to update Homebrew · App Store · macOS%s\n' "$DIM" "$NC"
+  printf '%s     update Homebrew · App Store · check macOS%s\n' "$DIM" "$NC"
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  Main
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Entry point. Order matters: parse flags first (they configure everything),
-# set up color/logging before any output, run pre-flight, then the three stages
-# (each gated by its DO_* flag), and finally the summary. Exit non-zero if any
+# Entry point. Order matters: parse flags and set up color first; a log cleanup
+# exits before logging or preflight. Normal runs then set up logging, run the
+# three stages, print the summary, and optionally notify. Exit non-zero if any
 # stage reported a failure, so callers and CI can detect trouble.
 main() {
   parse_args "$@"
   setup_colors
+  if [[ "$CLEAR_LOGS" == true ]]; then
+    clear_logs
+    exit $?
+  fi
   setup_logging
 
   banner
@@ -1124,11 +1159,8 @@ main() {
   fi
 
   status_close
-  # Notify before the summary: print_summary can end waiting on the restart
-  # prompt, and the whole point of --notify is to call back a user who tabbed
-  # away — they should get pinged, not silently waited for.
-  notify_done
   print_summary
+  notify_done
 
   [[ "$FAILURES" -gt 0 ]] && exit 1
   exit 0
