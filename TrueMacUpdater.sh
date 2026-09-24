@@ -125,12 +125,33 @@ setup_colors() {
   fi
 }
 
+# Print the terminal's height or width, read straight from /dev/tty. `tput`
+# can't be trusted for this: it asks stdout, then stderr, and inside a command
+# substitution (and again once logging routes both through `tee`) neither is the
+# terminal, so it quietly answers terminfo's 24×80 default. On a taller window
+# that put the status area's scroll region above the cursor, and every line of
+# output overwrote the last one.
+#   $1  rows | cols     $2  fallback when there's no terminal (cron, CI)
+term_size() {
+  local size value=""
+  size=$( { stty size < /dev/tty; } 2>/dev/null )
+  case "$1" in
+    rows) value=${size% *} ;;
+    cols) value=${size#* } ;;
+  esac
+  if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$2"
+  fi
+}
+
 # Print a horizontal rule that spans the terminal width, capped at 74 columns so
-# it stays readable on very wide windows. Falls back to 72 if `tput` can't tell
-# us the width (e.g. when piped).
+# it stays readable on very wide windows. Falls back to 72 when there's no
+# terminal to measure.
 rule() {
   local cols width line
-  cols=$( { tput cols; } 2>/dev/null || echo 72 )
+  cols=$(term_size cols 72)
   width=$(( cols < 74 ? cols : 74 ))
   line=$(printf '─%.0s' $(seq 1 "$width"))   # repeat "─" `width` times
   printf '%s%s%s\n' "$DIM" "$line" "$NC"
@@ -199,14 +220,16 @@ STATUS_APPSTORE="waiting"
 STATUS_SYSTEM="waiting"
 
 # Fence off the bottom rows and turn the pinned area on. Quietly does nothing
-# without a TTY, or on terminals too short to give up four rows. The newlines
-# scroll existing output up first so nothing gets painted over.
+# without a TTY, or on terminals too short to give up four rows. Any scroll
+# region left behind by an earlier program is cleared first, so the newlines
+# can scroll existing output up and nothing gets painted over.
 status_init() {
   [[ "$STDOUT_IS_TTY" == true ]] || return 0
-  STATUS_TERM_LINES=$( { tput lines; } 2>/dev/null || echo 0 )
+  STATUS_TERM_LINES=$(term_size rows 0)
   [[ "$STATUS_TERM_LINES" -ge 15 ]] || return 0
   STATUS_ENABLED=true
   {
+    printf '\0337\033[r\0338'
     printf '\n%.0s' $(seq 1 "$STATUS_ROWS")
     printf '\033[%dA' "$STATUS_ROWS"
     printf '\0337'
@@ -222,7 +245,7 @@ status_draw() {
   [[ "$STATUS_ENABLED" == true ]] || return 0
   local top cols row text
   top=$(( STATUS_TERM_LINES - STATUS_ROWS + 1 ))
-  cols=$( { tput cols; } 2>/dev/null || echo 80 )
+  cols=$(term_size cols 80)
   {
     printf '\0337'
     printf '\033[%d;1H\033[2K%s' "$top" "$DIM"
