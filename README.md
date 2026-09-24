@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](https://www.apple.com/macos/)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnu-bash&logoColor=white)](https://www.gnu.org/software/bash/)
-[![Version](https://img.shields.io/badge/version-2.2.0-blue)](TrueMacUpdater.sh)
+[![Release](https://img.shields.io/github/v/release/CubWatson/true-mac-updater)](https://github.com/CubWatson/true-mac-updater/releases/latest)
 
 Updates your Homebrew packages and Mac App Store apps, then checks for macOS updates.
 
@@ -79,6 +79,13 @@ If one stage fails, the others still run, and the summary shows what succeeded a
 git clone https://github.com/CubWatson/true-mac-updater.git
 cd true-mac-updater
 ./TrueMacUpdater.sh --dry-run     # preview first
+```
+
+Or download just the script from the [latest release](https://github.com/CubWatson/true-mac-updater/releases/latest):
+
+```bash
+curl -fLO https://github.com/CubWatson/true-mac-updater/releases/latest/download/TrueMacUpdater.sh
+chmod +x TrueMacUpdater.sh
 ```
 
 To run it from anywhere, add an alias to your `~/.zshrc`:
