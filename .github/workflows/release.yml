@@ -1,0 +1,66 @@
+# Checks every push that touches the script, and publishes a release when the
+# script's VERSION line names a version that has no tag yet. So releasing is:
+# bump VERSION, commit, push. The tag, the release notes (the commit subjects
+# since the previous tag), and the downloadable script are all made here.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [TrueMacUpdater.sh]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # macOS, so `bash -n` runs under the /bin/bash 3.2 the script must support.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # full history and tags, for the notes and tag check
+
+      - name: Check the script
+        run: |
+          command -v shellcheck >/dev/null || brew install shellcheck
+          /bin/bash -n TrueMacUpdater.sh
+          shellcheck -S warning TrueMacUpdater.sh
+          ./TrueMacUpdater.sh --help >/dev/null
+          ./TrueMacUpdater.sh --version
+
+      - name: Read VERSION
+        id: version
+        run: |
+          version=$(sed -n 's/^readonly VERSION="\([^"]*\)".*/\1/p' TrueMacUpdater.sh)
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::VERSION '${version}' isn't MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            echo "v${version} is already released; nothing to publish."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release
+        if: steps.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          previous=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          {
+            echo "## Changes"
+            echo
+            git log --no-merges --format='- %s' "${previous:+${previous}..}HEAD"
+            if [[ -n "$previous" ]]; then
+              echo
+              echo "Full diff: https://github.com/${GITHUB_REPOSITORY}/compare/${previous}...v${VERSION}"
+            fi
+          } > notes.md
+          gh release create "v${VERSION}" TrueMacUpdater.sh \
+            --target "$GITHUB_SHA" --title "v${VERSION}" --notes-file notes.md

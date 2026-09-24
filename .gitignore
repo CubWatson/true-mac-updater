@@ -1,6 +1,8 @@
-# Keep the public repository limited to the distributable script and its docs.
+# Keep the public repository limited to the distributable script, its docs,
+# and the release workflow.
 /*
 !/.gitignore
+!/.github/
 !/TrueMacUpdater.sh
 !/README.md
 !/LICENSE
