@@ -55,7 +55,7 @@ set -uo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 #  Metadata
 # ─────────────────────────────────────────────────────────────────────────────
-readonly VERSION="2.2.0"
+readonly VERSION="1.2.1"
 readonly SELF_NAME="TrueMacUpdater"
 # Below this much free disk, preflight warns and asks before continuing. Blunt
 # on purpose: package and App Store updates can still be large, and an update
